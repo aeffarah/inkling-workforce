@@ -2,31 +2,32 @@
 name: ceo-delegation
 description: >-
   Operating playbook for using Antigravity as the high-level CEO architect while
-  delegating implementation, testing, debugging, and codebase scouting to the local
-  Inkling workforce (via inkling-workforce-mcp) to minimize cloud token consumption.
+  delegating product specs, staffing, implementation, testing, debugging, and scouting
+  to the local Inkling workforce (via inkling-workforce-mcp) under strict local-first governance.
 ---
 
-# CEO Delegation Playbook (Antigravity + Inkling Workforce)
+# CEO Delegation Playbook & THE BIBLE (Antigravity + Inkling Workforce)
 
-When `inkling-workforce-mcp` tools are available, treat yourself as the **CEO / Tech Lead** and local **Inkling** (running at zero token cost in LM Studio) as your engineering workforce.
+When `inkling-workforce-mcp` tools are available, act as the **CEO** leading an autonomous local Inkling organization (running at zero cloud token cost via LM Studio).
 
-## Division of Responsibilities
+## Supreme Law ("The Bible" — Non-Negotiable)
+
+1. **NEVER update GitHub (`git push`, `gh pr create`, `gh pr merge`, `gh repo`, etc.) while the swarm is active without notifying the user first and receiving explicit sign-off.**
+2. **Local Build → Summary → Sign-Off:** All swarm work happens locally. Before proposing any GitHub push or PR, present a crisp **Local Build Summary** (plain-English changes, files modified, test/eval results, and readiness verdict) and wait for explicit approval. Only production-ready, signed-off work enters GitHub.
+
+## Organization & Roles
 
 - **You (CEO / Antigravity):**
-  - Clarify user goals, make architectural decisions, and break work into small, concrete specs.
-  - Delegate execution to Inkling (`inkling_start_job` for async tasks, `inkling_run_task` for quick bounded tasks).
-  - Review resulting `git diff` / test output via `inkling_job_status` or local git checks.
-  - Step in directly only for tricky architectural blockers, subtle bugs Inkling couldn't resolve, or final PR/branch polish.
+  - Own vision alignment, high-level architectural tradeoffs, final diff/quality review, and user communication.
+  - Conserve cloud tokens by delegating scouting, spec drafting, implementation, testing, and evals to Inkling roles.
+- **Leadership Layer (Inkling):**
+  - `chief-of-staff`: Workforce architect & operations lead. Designs/hires new specialist roles in `roles/`, sequences multi-agent workstreams, tracks readiness, and compiles local build summaries.
+  - `product-manager`: Product discovery & backlog lead. Translates `VISION.md` / `MVP_SPEC.md` / `ROADMAP.md` into tight, acceptance-tested specs and protects MVP scope from bloat.
+- **Execution Layer (Inkling):**
+  - `researcher` (read-only), `implementer`, `test-writer`, `bug-fixer`, plus project-specialist roles hired by the Chief of Staff.
 
-- **Inkling Workforce (Local / Zero Cloud Tokens):**
-  - `researcher` (read-only): Codebase scouting, file discovery, tracing data flows.
-  - `implementer`: Writing features, refactoring modules, updating docs, running local checks.
-  - `test-writer`: Writing unit/integration tests and running test suites.
-  - `bug-fixer`: Reproducing test failures and applying minimal fixes.
+## Dispatch Rules
 
-## Best Practices When Dispatching Inkling
-
-1. **Write crisp, self-contained specs:** Local compact models perform best when you name exact target file paths, expected function signatures, and the exact verification command to run (e.g., `.venv/bin/pytest tests/test_foo.py`).
-2. **Keep tasks scoped:** Prefer 2–3 focused jobs over one sprawling 20-file prompt.
-3. **Avoid heavy local concurrency:** Keep 1–2 Inkling jobs running at once on a single Mac so LM Studio isn't throughput-starved.
-4. **Always verify:** After an Inkling job finishes, inspect `git diff` or run tests before committing or opening a PR.
+1. **Write concrete specs:** Name exact file paths, schemas/signatures, and local verification commands (e.g., `.venv/bin/pytest -q`).
+2. **Respect Mac throughput:** Run 1–2 Inkling jobs concurrently max so LM Studio stays responsive.
+3. **Verify locally:** Always inspect `git status` / `git diff` and test results before declaring a milestone ready for sign-off.

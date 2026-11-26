@@ -4,20 +4,25 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
+  BREAK_MINUTES,
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
   DEFAULT_ROLE,
   chatCompletion,
+  generateDigest,
   getGitShortStatus,
+  getThermalStatus,
   listJobs,
   listModels,
   listRoles,
   loadJobMeta,
   loadRole,
   newJobId,
+  resetThermalState,
   runAgent,
   saveJobMeta,
   tailJobLog,
+  triggerThermalBreak,
 } from "./agent.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -49,7 +54,7 @@ const TOOLS = [
   },
   {
     name: "inkling_start_job",
-    description: "Launch an autonomous Inkling worker agent in the background on any workspace directory. Returns a job_id immediately.",
+    description: "Launch an autonomous Inkling worker agent in the background on any workspace directory. Respects single-flight GPU lock and 45m/15m thermal breaks.",
     inputSchema: {
       type: "object",
       properties: {
@@ -81,7 +86,7 @@ const TOOLS = [
   },
   {
     name: "inkling_job_status",
-    description: "Check status, recent logs, summary, and git status for an Inkling job.",
+    description: "Check status, thermal cooldown state, recent logs, summary, and git status for an Inkling job.",
     inputSchema: {
       type: "object",
       properties: {
@@ -93,7 +98,7 @@ const TOOLS = [
   },
   {
     name: "inkling_list_jobs",
-    description: "List recent and currently running Inkling background jobs.",
+    description: "List recent/running Inkling jobs alongside current Mac thermal duty-cycle status.",
     inputSchema: {
       type: "object",
       properties: {
@@ -110,6 +115,29 @@ const TOOLS = [
         job_id: { type: "string", description: "Job ID to cancel" },
       },
       required: ["job_id"],
+    },
+  },
+  {
+    name: "inkling_thermal",
+    description: "Inspect or control the 45m/15m Mac thermal duty-cycle state (status, trigger break, or reset).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["status", "break", "reset"], description: "Action (default: status)" },
+        minutes: { type: "integer", description: `Cooldown minutes when action='break' (default: ${BREAK_MINUTES})` },
+      },
+    },
+  },
+  {
+    name: "inkling_digest",
+    description: "Generate a 4-6h Local Build & GitHub Triage Digest for a target repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: { type: "string", description: "Target repository path" },
+        hours: { type: "number", description: "Lookback hours (default: 5)" },
+      },
+      required: ["cwd"],
     },
   },
 ];
@@ -212,6 +240,7 @@ async function handleToolCall(name, args = {}) {
             role: roleDef.name,
             model: args.model || DEFAULT_MODEL,
             cwd: path.resolve(String(args.cwd)),
+            thermal: getThermalStatus(),
           },
           null,
           2
@@ -238,7 +267,7 @@ async function handleToolCall(name, args = {}) {
       const liveGit = job.cwd ? getGitShortStatus(job.cwd) : "";
       const recentLog = tailJobLog(job.id, Number(args.log_lines) || 30);
       return textResult(
-        JSON.stringify({ ...job, liveGitStatus: liveGit }, null, 2) +
+        JSON.stringify({ ...job, liveGitStatus: liveGit, thermal: getThermalStatus() }, null, 2) +
           (recentLog ? `\n\n--- Recent Log ---\n${recentLog}` : "")
       );
     }
@@ -254,7 +283,7 @@ async function handleToolCall(name, args = {}) {
         startedAt: j.startedAt,
         task: j.task.slice(0, 120),
       }));
-      return textResult(JSON.stringify(jobs, null, 2));
+      return textResult(JSON.stringify({ thermal: getThermalStatus(), jobs }, null, 2));
     }
 
     case "inkling_cancel_job": {
@@ -272,6 +301,26 @@ async function handleToolCall(name, args = {}) {
       job.finishedAt = new Date().toISOString();
       saveJobMeta(job);
       return textResult(`Cancelled job ${job.id} (pid ${job.pid}).`);
+    }
+
+    case "inkling_thermal": {
+      const action = args.action || "status";
+      if (action === "break") {
+        return textResult(JSON.stringify(triggerThermalBreak(Number(args.minutes) || BREAK_MINUTES), null, 2));
+      }
+      if (action === "reset") {
+        return textResult(JSON.stringify(resetThermalState(), null, 2));
+      }
+      return textResult(JSON.stringify(getThermalStatus(), null, 2));
+    }
+
+    case "inkling_digest": {
+      return textResult(
+        generateDigest({
+          cwd: String(args.cwd || process.cwd()),
+          hours: Number(args.hours) || 5,
+        })
+      );
     }
 
     default:
@@ -303,7 +352,7 @@ rl.on("line", async (line) => {
         result: {
           protocolVersion: params?.protocolVersion || "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "inkling-workforce-mcp", version: "0.1.0" },
+          serverInfo: { name: "inkling-workforce-mcp", version: "0.2.0" },
         },
       });
     } else if (method === "ping") {

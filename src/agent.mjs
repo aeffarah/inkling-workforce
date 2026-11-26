@@ -12,13 +12,244 @@ export const DEFAULT_BASE_URL = process.env.INKLING_BASE_URL || "http://localhos
 export const DEFAULT_MODEL = process.env.INKLING_MODEL || "inkling-2-mini@q2_k_xl";
 export const DEFAULT_API_KEY = process.env.INKLING_API_KEY || "lm-studio";
 export const DEFAULT_ROLE = process.env.INKLING_ROLE || "implementer";
-export const JOBS_DIR = process.env.INKLING_JOBS_DIR || path.join(os.homedir(), ".inkling-workforce", "jobs");
+
+export const STATE_DIR = process.env.INKLING_STATE_DIR || path.join(os.homedir(), ".inkling-workforce");
+export const JOBS_DIR = process.env.INKLING_JOBS_DIR || path.join(STATE_DIR, "jobs");
+export const THERMAL_FILE = path.join(STATE_DIR, "thermal.json");
+export const LOCK_FILE = path.join(STATE_DIR, "inference.lock");
+
+// Thermal & anti-burnout pacing defaults (20m work / 10m break = 20m rest/hr + hardware sensor)
+export const WORK_WINDOW_MINUTES = Number(process.env.INKLING_WORK_MINUTES ?? 20);
+export const BREAK_MINUTES = Number(process.env.INKLING_BREAK_MINUTES ?? 10);
+export const IDLE_RESET_MINUTES = Number(process.env.INKLING_IDLE_RESET_MINUTES ?? 10);
+export const STEP_COOLDOWN_MS = Number(process.env.INKLING_STEP_COOLDOWN_MS ?? 8000);
+export const WARM_STEP_COOLDOWN_MS = Number(process.env.INKLING_WARM_STEP_COOLDOWN_MS ?? 18000);
+export const TASK_COOLDOWN_SEC = Number(process.env.INKLING_TASK_COOLDOWN_SEC ?? 60);
+
+const THERMAL_LABELS = ["nominal", "fair", "serious", "critical"];
+
+export function getMacHardwareThermal() {
+  if (process.platform !== "darwin") return { level: 0, label: "nominal" };
+  try {
+    const raw = execFileSync(
+      "/usr/bin/osascript",
+      ["-l", "JavaScript", "-e", 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState'],
+      { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    const level = Number(raw);
+    if (Number.isInteger(level) && level >= 0 && level <= 3) {
+      return { level, label: THERMAL_LABELS[level] };
+    }
+  } catch {
+    // fallback if osascript unavailable
+  }
+  return { level: 0, label: "nominal" };
+}
 
 const IGNORED_DIRS = new Set([".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", "dist", "build"]);
 
-function ensureJobsDir() {
+function ensureDirs() {
   fs.mkdirSync(JOBS_DIR, { recursive: true });
 }
+
+export function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isPidAlive(pid) {
+  if (!pid || typeof pid !== "number") return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Thermal Duty-Cycle & Single-Flight GPU Guard ───────────────────────────
+
+export function readThermalState() {
+  ensureDirs();
+  try {
+    if (fs.existsSync(THERMAL_FILE)) {
+      return JSON.parse(fs.readFileSync(THERMAL_FILE, "utf8"));
+    }
+  } catch {
+    // ignore corrupt state
+  }
+  return { windowStartedAt: null, lastCallAt: null, cooldownUntil: null };
+}
+
+export function writeThermalState(state) {
+  ensureDirs();
+  fs.writeFileSync(THERMAL_FILE, JSON.stringify(state, null, 2), "utf8");
+}
+
+export function triggerThermalBreak(minutes = BREAK_MINUTES) {
+  const now = Date.now();
+  const cooldownUntil = now + minutes * 60_000;
+  const state = { windowStartedAt: null, lastCallAt: now, cooldownUntil };
+  writeThermalState(state);
+  return getThermalStatus();
+}
+
+export function resetThermalState() {
+  const state = { windowStartedAt: null, lastCallAt: null, cooldownUntil: null };
+  writeThermalState(state);
+  return getThermalStatus();
+}
+
+export function getThermalStatus() {
+  const now = Date.now();
+  const s = readThermalState();
+  const workMs = WORK_WINDOW_MINUTES * 60_000;
+  const idleResetMs = IDLE_RESET_MINUTES * 60_000;
+  const hw = getMacHardwareThermal();
+
+  let lockHolderPid = null;
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const lock = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+      if (isPidAlive(lock.pid)) lockHolderPid = lock.pid;
+    }
+  } catch {
+    // ignore
+  }
+
+  if (s.cooldownUntil && now < s.cooldownUntil) {
+    const remainingSec = Math.ceil((s.cooldownUntil - now) / 1000);
+    return {
+      mode: "cooling_down",
+      macThermal: `${hw.label} (${hw.level}/3)`,
+      remainingBreakSec: remainingSec,
+      resumesAt: new Date(s.cooldownUntil).toISOString(),
+      policy: `${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | step breather ${STEP_COOLDOWN_MS}ms (${WARM_STEP_COOLDOWN_MS}ms if warm)`,
+      activeInferencePid: lockHolderPid,
+    };
+  }
+
+  const idleTooLong = !s.lastCallAt || now - s.lastCallAt >= idleResetMs;
+  const activeElapsedMs = idleTooLong || !s.windowStartedAt ? 0 : Math.max(0, now - s.windowStartedAt);
+  const remainingWorkMin = Math.max(0, Math.round((workMs - activeElapsedMs) / 60_000));
+
+  return {
+    mode: hw.level >= 2 ? "hardware_hot_pause" : lockHolderPid ? "inferring" : "ready",
+    macThermal: `${hw.label} (${hw.level}/3)`,
+    activeWindowElapsedMin: Math.round(activeElapsedMs / 60_000),
+    nextBreakInMin: remainingWorkMin,
+    policy: `${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | step breather ${STEP_COOLDOWN_MS}ms (${WARM_STEP_COOLDOWN_MS}ms if warm)`,
+    activeInferencePid: lockHolderPid,
+  };
+}
+
+export async function enforceThermalPolicy(onLog = null) {
+  // 0. Hardware closed-loop guard: if macOS reports Serious (2) or Critical (3) heat, pause immediately!
+  let hw = getMacHardwareThermal();
+  while (hw.level >= 2) {
+    const emergencyBreakMs = BREAK_MINUTES * 60_000;
+    const cooldownUntil = Date.now() + emergencyBreakMs;
+    writeThermalState({ windowStartedAt: null, lastCallAt: Date.now(), cooldownUntil });
+    if (onLog) {
+      onLog(
+        `🔥 macOS thermal sensor reports ${hw.label.toUpperCase()} (${hw.level}/3) — taking immediate ${BREAK_MINUTES}m anti-burnout break!`
+      );
+    }
+    await sleep(emergencyBreakMs);
+    hw = getMacHardwareThermal();
+  }
+
+  if (WORK_WINDOW_MINUTES <= 0 || BREAK_MINUTES <= 0) return;
+
+  const workMs = WORK_WINDOW_MINUTES * 60_000;
+  const breakMs = BREAK_MINUTES * 60_000;
+  const idleResetMs = IDLE_RESET_MINUTES * 60_000;
+
+  let state = readThermalState();
+  let now = Date.now();
+
+  // 1. Respect an already-active thermal break
+  if (state.cooldownUntil && now < state.cooldownUntil) {
+    const waitMs = state.cooldownUntil - now;
+    const mins = (waitMs / 60_000).toFixed(1);
+    if (onLog) {
+      onLog(`🌡️ Thermal break active — resting Mac for ${mins}m (until ${new Date(state.cooldownUntil).toISOString()})`);
+    }
+    await sleep(waitMs);
+    now = Date.now();
+    state = { windowStartedAt: now, lastCallAt: now, cooldownUntil: null };
+    writeThermalState(state);
+    return;
+  }
+
+  // 2. If idle for >= IDLE_RESET_MINUTES, start a fresh cool window
+  if (!state.windowStartedAt || !state.lastCallAt || now - state.lastCallAt >= idleResetMs) {
+    state = { windowStartedAt: now, lastCallAt: now, cooldownUntil: null };
+    writeThermalState(state);
+    return;
+  }
+
+  // 3. If continuous active window hit WORK_WINDOW_MINUTES, take a BREAK_MINUTES cooldown break now
+  if (now - state.windowStartedAt >= workMs) {
+    const cooldownUntil = now + breakMs;
+    state = { windowStartedAt: null, lastCallAt: now, cooldownUntil };
+    writeThermalState(state);
+    if (onLog) {
+      onLog(
+        `🌡️ Reached ${WORK_WINDOW_MINUTES}m active sprint — taking ${BREAK_MINUTES}m employee cooldown break until ${new Date(cooldownUntil).toISOString()}`
+      );
+    }
+    await sleep(breakMs);
+    const resumed = Date.now();
+    writeThermalState({ windowStartedAt: resumed, lastCallAt: resumed, cooldownUntil: null });
+    if (onLog) onLog(`🌡️ Break complete — resuming work with a fresh ${WORK_WINDOW_MINUTES}m sprint.`);
+    return;
+  }
+
+  state.lastCallAt = now;
+  writeThermalState(state);
+}
+
+async function withSingleFlightLock(fn, onLog = null) {
+  ensureDirs();
+  let loggedWait = false;
+  while (true) {
+    try {
+      const fd = fs.openSync(LOCK_FILE, "wx");
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
+      fs.closeSync(fd);
+      break;
+    } catch {
+      try {
+        const existing = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+        if (!isPidAlive(existing.pid)) {
+          fs.unlinkSync(LOCK_FILE);
+          continue;
+        }
+      } catch {
+        try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+        continue;
+      }
+      if (!loggedWait && onLog) {
+        onLog("⏳ Waiting for single-flight LM Studio GPU lock...");
+        loggedWait = true;
+      }
+      await sleep(2000);
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      const cur = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+      if (cur.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// ─── Workspace, Roles & Tool Execution ──────────────────────────────────────
 
 function resolveInside(cwd, targetPath) {
   const resolvedCwd = path.resolve(cwd);
@@ -78,9 +309,7 @@ export const AGENT_TOOLS = [
       description: "List files and directories at a path relative to the workspace root.",
       parameters: {
         type: "object",
-        properties: {
-          path: { type: "string", description: "Relative path (default '.')" },
-        },
+        properties: { path: { type: "string", description: "Relative path (default '.')" } },
         required: ["path"],
       },
     },
@@ -168,6 +397,25 @@ export const READ_ONLY_TOOLS = AGENT_TOOLS.filter((t) =>
   ["list_dir", "read_file", "search_files"].includes(t.function.name)
 );
 
+const BLOCKED_REMOTE_PATTERNS = [
+  /\bgit\s+push\b/i,
+  /\bgit\s+remote\s+(add|set-url|remove|rm|rename)\b/i,
+  /\bgh\s+(pr|repo|release|gist|issue)\s+(create|merge|close|reopen|edit|delete|sync|fork|comment)\b/i,
+  /\bgh\s+api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE)/i,
+];
+
+export function checkCommandGovernance(cmd) {
+  for (const pat of BLOCKED_REMOTE_PATTERNS) {
+    if (pat.test(cmd)) {
+      return (
+        "BLOCKED BY GOVERNANCE BIBLE: Inkling agents may NEVER push to GitHub or create/mutate PRs or remotes. " +
+        "Keep all work local, run local tests/evals, and return a Local Build Summary for CEO & founder sign-off."
+      );
+    }
+  }
+  return null;
+}
+
 async function executeTool(name, args, { cwd, readOnly }) {
   if (readOnly && !["list_dir", "read_file", "search_files"].includes(name)) {
     return `Error: Tool '${name}' is disabled in read-only mode.`;
@@ -231,9 +479,12 @@ async function executeTool(name, args, { cwd, readOnly }) {
       }
 
       case "run_command": {
+        const cmdStr = String(args.command || "");
+        const violation = checkCommandGovernance(cmdStr);
+        if (violation) return violation;
         const timeout = Math.min(Math.max(Number(args.timeout_ms) || 60000, 1000), 300000);
         return await new Promise((resolve) => {
-          const child = spawn("/bin/zsh", ["-lc", String(args.command)], {
+          const child = spawn("/bin/zsh", ["-lc", `setopt NO_EQUALS 2>/dev/null; ${cmdStr}`], {
             cwd: path.resolve(cwd),
             env: process.env,
           });
@@ -283,36 +534,41 @@ export async function chatCompletion({
   model = DEFAULT_MODEL,
   baseUrl = DEFAULT_BASE_URL,
   temperature = 0.2,
-  maxTokens = 4096,
+  maxTokens = 2800,
+  onLog = null,
 }) {
-  const body = {
-    model,
-    messages,
-    temperature,
-    max_tokens: maxTokens,
-  };
-  if (tools && tools.length > 0) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
+  await enforceThermalPolicy(onLog);
 
-  const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${DEFAULT_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
+  return await withSingleFlightLock(async () => {
+    const body = {
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    };
+    if (tools && tools.length > 0) {
+      body.tools = tools;
+      body.tool_choice = "auto";
+    }
 
-  if (!res.ok) {
-    throw new Error(`LM Studio chat/completions HTTP ${res.status}: ${await res.text()}`);
-  }
-  return await res.json();
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${DEFAULT_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      throw new Error(`LM Studio chat/completions HTTP ${res.status}: ${await res.text()}`);
+    }
+    return await res.json();
+  }, onLog);
 }
 
 export function getJobPaths(jobId) {
-  ensureJobsDir();
+  ensureDirs();
   return {
     meta: path.join(JOBS_DIR, `${jobId}.json`),
     log: path.join(JOBS_DIR, `${jobId}.log`),
@@ -390,11 +646,17 @@ export async function runAgent({
     if (onLog) onLog(msg);
   };
 
-  log(`Started job ${id} | role=${roleDef.name} | model=${model} | cwd=${resolvedCwd} | readOnly=${effectiveReadOnly}`);
+  log(
+    `Started job ${id} | role=${roleDef.name} | model=${model} | cwd=${resolvedCwd} | thermal=${WORK_WINDOW_MINUTES}m/${BREAK_MINUTES}m`
+  );
 
   const tools = effectiveReadOnly ? READ_ONLY_TOOLS : AGENT_TOOLS;
   const systemPrompt = [
     roleDef.instructions,
+    "",
+    "## Mandatory Governance Law (THE BIBLE)",
+    "- NEVER run `git push`, `gh pr create`, or any command that updates GitHub. Only local edits, local tests, and local inspection are permitted.",
+    "- Every completed task MUST end with a crisp Local Build Summary (what changed, files touched, exact test/verification output, and any open questions) so the CEO can present it for founder sign-off before anything touches GitHub.",
     "",
     `Target workspace directory: ${resolvedCwd}`,
   ].join("\n");
@@ -406,10 +668,19 @@ export async function runAgent({
 
   try {
     for (let step = 1; step <= effectiveMaxSteps; step++) {
+      if (step > 1) {
+        const hw = getMacHardwareThermal();
+        const breatherMs = hw.level >= 1 ? WARM_STEP_COOLDOWN_MS : STEP_COOLDOWN_MS;
+        if (breatherMs > 0) {
+          if (hw.level >= 1) log(`🌡️ Mac warm (${hw.label}) — extending step breather to ${breatherMs / 1000}s`);
+          await sleep(breatherMs);
+        }
+      }
+
       job.step = step;
       saveJobMeta(job);
 
-      const response = await chatCompletion({ messages, tools, model, baseUrl });
+      const response = await chatCompletion({ messages, tools, model, baseUrl, onLog: log });
       const choice = response.choices?.[0];
       if (!choice?.message) {
         throw new Error(`Empty response from LM Studio: ${JSON.stringify(response)}`);
@@ -456,17 +727,28 @@ export async function runAgent({
         messages.push({
           role: "tool",
           tool_call_id: tc.id || `call_${step}_${fnName}`,
-          content: result,
+          content:
+            step >= Math.max(1, effectiveMaxSteps - 3)
+              ? `${result}\n\n[STEP BUDGET WARNING: Step ${step}/${effectiveMaxSteps}. Stop exploring immediately and complete all required file writes and your final summary now.]`
+              : result,
         });
       }
     }
 
+    log(`Reached maxSteps=${effectiveMaxSteps}; requesting final tool-free synthesis...`);
+    messages.push({
+      role: "user",
+      content: `You have reached the ${effectiveMaxSteps}-step tool limit. Without calling any tools, deliver your complete final report and Local Build Summary now.`,
+    });
+    const synthRes = await chatCompletion({ messages, tools: null, model, baseUrl, onLog: log });
+    const synthText = synthRes.choices?.[0]?.message?.content?.trim();
+
     job.status = "completed";
     job.finishedAt = new Date().toISOString();
-    job.summary = `Reached max_steps (${effectiveMaxSteps}). Check job log and git status for partial progress.`;
+    job.summary = synthText || `Reached max_steps (${effectiveMaxSteps}). Check job log and git status for partial progress.`;
     job.gitStatus = getGitShortStatus(resolvedCwd);
     saveJobMeta(job);
-    log(`Stopped after reaching maxSteps=${effectiveMaxSteps}.`);
+    log(`Completed via final synthesis after maxSteps=${effectiveMaxSteps}.`);
     return job;
   } catch (err) {
     job.status = "failed";
@@ -480,7 +762,7 @@ export async function runAgent({
 }
 
 export function listJobs(limit = 20) {
-  ensureJobsDir();
+  ensureDirs();
   return fs
     .readdirSync(JOBS_DIR)
     .filter((f) => f.endsWith(".json"))
@@ -501,4 +783,74 @@ export function tailJobLog(jobId, lines = 40) {
   if (!fs.existsSync(log)) return "";
   const all = fs.readFileSync(log, "utf8").trim().split("\n");
   return all.slice(-lines).join("\n");
+}
+
+export function generateDigest({ cwd = process.cwd(), hours = 5 } = {}) {
+  const resolvedCwd = path.resolve(cwd);
+  const cutoff = Date.now() - hours * 3600_000;
+  const recentJobs = listJobs(50).filter((j) => {
+    const t = Date.parse(j.finishedAt || j.startedAt || "");
+    return !Number.isNaN(t) && t >= cutoff;
+  });
+
+  let gitBranchStatus = "";
+  let gitDiffStat = "";
+  let unpushedCommits = "";
+  try {
+    gitBranchStatus = execFileSync("git", ["status", "-sb"], { cwd: resolvedCwd, encoding: "utf8" }).trim();
+    gitDiffStat = execFileSync("git", ["diff", "--stat"], { cwd: resolvedCwd, encoding: "utf8" }).trim();
+    unpushedCommits = execFileSync("git", ["log", "@{u}..HEAD", "--oneline"], {
+      cwd: resolvedCwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    // ignore if no upstream or not git repo
+  }
+
+  let pytestSummary = "(no .venv/bin/pytest found)";
+  const pytestBin = path.join(resolvedCwd, ".venv", "bin", "pytest");
+  if (fs.existsSync(pytestBin)) {
+    try {
+      pytestSummary = execFileSync(pytestBin, ["-q"], { cwd: resolvedCwd, encoding: "utf8" }).trim();
+    } catch (err) {
+      pytestSummary = `FAILED:\n${(err.stdout || "") + (err.stderr || "")}`.trim();
+    }
+  }
+
+  const thermal = getThermalStatus();
+  const completed = recentJobs.filter((j) => j.status === "completed");
+  const running = recentJobs.filter((j) => j.status === "running");
+  const failed = recentJobs.filter((j) => j.status === "failed" || j.status === "cancelled");
+
+  const lines = [
+    `# ${hours}-Hour Local Build & GitHub Triage Digest`,
+    `Generated: ${new Date().toISOString()}`,
+    `Target Repo: ${resolvedCwd}`,
+    `Thermal Status: ${thermal.mode} (${thermal.policy})`,
+    "",
+    `## 1. Local Git & Test Gate`,
+    "```",
+    gitBranchStatus || "(clean)",
+    gitDiffStat ? `\nDiff Stat:\n${gitDiffStat}` : "",
+    unpushedCommits ? `\nLocal Unpushed Commits:\n${unpushedCommits}` : "\nLocal Unpushed Commits: (none)",
+    "```",
+    `**Local Test Suite:** \`${pytestSummary.replace(/\n/g, " | ")}\``,
+    "",
+    `## 2. Inkling Jobs in Last ${hours}h (${completed.length} completed, ${running.length} running, ${failed.length} failed/cancelled)`,
+  ];
+
+  if (!recentJobs.length) {
+    lines.push("- No Inkling jobs ran in this window.");
+  } else {
+    for (const j of recentJobs) {
+      const firstLine = (j.summary || j.error || "").split("\n").find((l) => l.trim()) || "";
+      lines.push(
+        `- **${j.id}** [${j.status.toUpperCase()}] role=\`${j.role}\` steps=${j.step}/${j.maxSteps}: ${j.task.slice(0, 90)}${j.task.length > 90 ? "…" : ""}` +
+          (firstLine ? `\n  - _Outcome:_ ${firstLine.slice(0, 140)}` : "")
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
