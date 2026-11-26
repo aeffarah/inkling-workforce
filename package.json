@@ -1,0 +1,12 @@
+{
+  "name": "inkling-workforce",
+  "version": "0.1.0",
+  "description": "Local Inkling agent workforce & Antigravity MCP plugin backed by LM Studio",
+  "type": "module",
+  "bin": {
+    "inkling": "./src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

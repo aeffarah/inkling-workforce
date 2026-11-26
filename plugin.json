@@ -1,0 +1,11 @@
+{
+  "name": "inkling-workforce",
+  "displayName": "Inkling Local Workforce",
+  "version": "0.1.0",
+  "description": "Delegate coding, testing, debugging, and research tasks to local Inkling models via LM Studio so Antigravity acts as a token-efficient CEO.",
+  "suggestedPrompts": [
+    "Have Inkling research this repo's architecture and summarize the entrypoints",
+    "Plan the next feature and delegate implementation and tests to Inkling",
+    "Check the status and diffs of running Inkling background jobs"
+  ]
+}

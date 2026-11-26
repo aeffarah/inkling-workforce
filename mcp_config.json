@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "inkling-workforce-mcp": {
+      "command": "/opt/homebrew/opt/node@24/bin/node",
+      "args": [
+        "/Users/andreweffarah/Projects/inkling-workforce/src/mcp-server.mjs"
+      ],
+      "env": {
+        "INKLING_BASE_URL": "http://localhost:1235/v1",
+        "INKLING_MODEL": "inkling-2-mini@q2_k_xl"
+      }
+    }
+  }
+}
