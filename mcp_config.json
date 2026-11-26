@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "inkling-workforce-mcp": {
-      "command": "/opt/homebrew/opt/node@24/bin/node",
+      "command": "/bin/zsh",
       "args": [
-        "/Users/andreweffarah/Projects/inkling-workforce/src/mcp-server.mjs"
+        "-lc",
+        "exec /opt/homebrew/opt/node@24/bin/node \"$HOME/Projects/inkling-workforce/src/mcp-server.mjs\""
       ],
       "env": {
         "INKLING_BASE_URL": "http://localhost:1235/v1",

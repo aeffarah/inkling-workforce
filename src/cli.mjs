@@ -10,6 +10,7 @@ import {
   TASK_COOLDOWN_SEC,
   WORK_WINDOW_MINUTES,
   enforceThermalPolicy,
+  generateBenchmark,
   generateDigest,
   getThermalStatus,
   listJobs,
@@ -171,8 +172,15 @@ async function main() {
       generateDigest({
         cwd: flags.cwd || process.cwd(),
         hours: Number(flags.hours) || 5,
-      })
+      }) +
+        "\n\n" +
+        generateBenchmark()
     );
+    return;
+  }
+
+  if (cmd === "benchmark") {
+    console.log(generateBenchmark());
     return;
   }
 

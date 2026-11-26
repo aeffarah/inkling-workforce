@@ -27,25 +27,6 @@ export const WARM_STEP_COOLDOWN_MS = Number(process.env.INKLING_WARM_STEP_COOLDO
 export const TASK_COOLDOWN_SEC = Number(process.env.INKLING_TASK_COOLDOWN_SEC ?? 60);
 
 const THERMAL_LABELS = ["nominal", "fair", "serious", "critical"];
-
-export function getMacHardwareThermal() {
-  if (process.platform !== "darwin") return { level: 0, label: "nominal" };
-  try {
-    const raw = execFileSync(
-      "/usr/bin/osascript",
-      ["-l", "JavaScript", "-e", 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState'],
-      { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
-    ).trim();
-    const level = Number(raw);
-    if (Number.isInteger(level) && level >= 0 && level <= 3) {
-      return { level, label: THERMAL_LABELS[level] };
-    }
-  } catch {
-    // fallback if osascript unavailable
-  }
-  return { level: 0, label: "nominal" };
-}
-
 const IGNORED_DIRS = new Set([".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", "dist", "build"]);
 
 function ensureDirs() {
@@ -66,7 +47,25 @@ function isPidAlive(pid) {
   }
 }
 
-// ─── Thermal Duty-Cycle & Single-Flight GPU Guard ───────────────────────────
+// ─── Thermal Duty-Cycle, Hardware Sensor & Single-Flight GPU Guard ──────────
+
+export function getMacHardwareThermal() {
+  if (process.platform !== "darwin") return { level: 0, label: "nominal" };
+  try {
+    const raw = execFileSync(
+      "/usr/bin/osascript",
+      ["-l", "JavaScript", "-e", 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState'],
+      { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    const level = Number(raw);
+    if (Number.isInteger(level) && level >= 0 && level <= 3) {
+      return { level, label: THERMAL_LABELS[level] };
+    }
+  } catch {
+    // fallback if osascript unavailable
+  }
+  return { level: 0, label: "nominal" };
+}
 
 export function readThermalState() {
   ensureDirs();
@@ -88,14 +87,12 @@ export function writeThermalState(state) {
 export function triggerThermalBreak(minutes = BREAK_MINUTES) {
   const now = Date.now();
   const cooldownUntil = now + minutes * 60_000;
-  const state = { windowStartedAt: null, lastCallAt: now, cooldownUntil };
-  writeThermalState(state);
+  writeThermalState({ windowStartedAt: null, lastCallAt: now, cooldownUntil });
   return getThermalStatus();
 }
 
 export function resetThermalState() {
-  const state = { windowStartedAt: null, lastCallAt: null, cooldownUntil: null };
-  writeThermalState(state);
+  writeThermalState({ windowStartedAt: null, lastCallAt: null, cooldownUntil: null });
   return getThermalStatus();
 }
 
@@ -116,14 +113,15 @@ export function getThermalStatus() {
     // ignore
   }
 
+  const policy = `${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | step breather ${STEP_COOLDOWN_MS}ms (${WARM_STEP_COOLDOWN_MS}ms if warm)`;
+
   if (s.cooldownUntil && now < s.cooldownUntil) {
-    const remainingSec = Math.ceil((s.cooldownUntil - now) / 1000);
     return {
       mode: "cooling_down",
       macThermal: `${hw.label} (${hw.level}/3)`,
-      remainingBreakSec: remainingSec,
+      remainingBreakSec: Math.ceil((s.cooldownUntil - now) / 1000),
       resumesAt: new Date(s.cooldownUntil).toISOString(),
-      policy: `${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | step breather ${STEP_COOLDOWN_MS}ms (${WARM_STEP_COOLDOWN_MS}ms if warm)`,
+      policy,
       activeInferencePid: lockHolderPid,
     };
   }
@@ -137,13 +135,12 @@ export function getThermalStatus() {
     macThermal: `${hw.label} (${hw.level}/3)`,
     activeWindowElapsedMin: Math.round(activeElapsedMs / 60_000),
     nextBreakInMin: remainingWorkMin,
-    policy: `${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | step breather ${STEP_COOLDOWN_MS}ms (${WARM_STEP_COOLDOWN_MS}ms if warm)`,
+    policy,
     activeInferencePid: lockHolderPid,
   };
 }
 
 export async function enforceThermalPolicy(onLog = null) {
-  // 0. Hardware closed-loop guard: if macOS reports Serious (2) or Critical (3) heat, pause immediately!
   let hw = getMacHardwareThermal();
   while (hw.level >= 2) {
     const emergencyBreakMs = BREAK_MINUTES * 60_000;
@@ -167,32 +164,27 @@ export async function enforceThermalPolicy(onLog = null) {
   let state = readThermalState();
   let now = Date.now();
 
-  // 1. Respect an already-active thermal break
   if (state.cooldownUntil && now < state.cooldownUntil) {
     const waitMs = state.cooldownUntil - now;
-    const mins = (waitMs / 60_000).toFixed(1);
     if (onLog) {
-      onLog(`🌡️ Thermal break active — resting Mac for ${mins}m (until ${new Date(state.cooldownUntil).toISOString()})`);
+      onLog(
+        `🌡️ Thermal break active — resting Mac for ${(waitMs / 60_000).toFixed(1)}m (until ${new Date(state.cooldownUntil).toISOString()})`
+      );
     }
     await sleep(waitMs);
     now = Date.now();
-    state = { windowStartedAt: now, lastCallAt: now, cooldownUntil: null };
-    writeThermalState(state);
+    writeThermalState({ windowStartedAt: now, lastCallAt: now, cooldownUntil: null });
     return;
   }
 
-  // 2. If idle for >= IDLE_RESET_MINUTES, start a fresh cool window
   if (!state.windowStartedAt || !state.lastCallAt || now - state.lastCallAt >= idleResetMs) {
-    state = { windowStartedAt: now, lastCallAt: now, cooldownUntil: null };
-    writeThermalState(state);
+    writeThermalState({ windowStartedAt: now, lastCallAt: now, cooldownUntil: null });
     return;
   }
 
-  // 3. If continuous active window hit WORK_WINDOW_MINUTES, take a BREAK_MINUTES cooldown break now
   if (now - state.windowStartedAt >= workMs) {
     const cooldownUntil = now + breakMs;
-    state = { windowStartedAt: null, lastCallAt: now, cooldownUntil };
-    writeThermalState(state);
+    writeThermalState({ windowStartedAt: null, lastCallAt: now, cooldownUntil });
     if (onLog) {
       onLog(
         `🌡️ Reached ${WORK_WINDOW_MINUTES}m active sprint — taking ${BREAK_MINUTES}m employee cooldown break until ${new Date(cooldownUntil).toISOString()}`
@@ -534,7 +526,7 @@ export async function chatCompletion({
   model = DEFAULT_MODEL,
   baseUrl = DEFAULT_BASE_URL,
   temperature = 0.2,
-  maxTokens = 2800,
+  maxTokens = 6144,
   onLog = null,
 }) {
   await enforceThermalPolicy(onLog);
@@ -654,6 +646,10 @@ export async function runAgent({
   const systemPrompt = [
     roleDef.instructions,
     "",
+    "## Execution Efficiency Rules",
+    "- Keep internal reasoning concise so you never hit output token limits.",
+    "- Write ONE file per step (`write_file` / `edit_file`) rather than batching multiple large files into a single response.",
+    "",
     "## Mandatory Governance Law (THE BIBLE)",
     "- NEVER run `git push`, `gh pr create`, or any command that updates GitHub. Only local edits, local tests, and local inspection are permitted.",
     "- Every completed task MUST end with a crisp Local Build Summary (what changed, files touched, exact test/verification output, and any open questions) so the CEO can present it for founder sign-off before anything touches GitHub.",
@@ -699,9 +695,21 @@ export async function runAgent({
 
       const toolCalls = msg.tool_calls;
       if (!toolCalls || toolCalls.length === 0) {
+        if (choice.finish_reason === "length") {
+          log(`Step ${step} hit max_tokens truncation before tool call; prompting concise retry...`);
+          messages.push({
+            role: "user",
+            content:
+              "Your response was cut off by max_tokens before emitting a tool call or final summary. Keep reasoning very short (<150 words) and write ONE file at a time.",
+          });
+          continue;
+        }
+        if (!msg.content || !msg.content.trim()) {
+          throw new Error(`Model returned an empty completion (finish_reason=${choice.finish_reason || "unknown"}).`);
+        }
         job.status = "completed";
         job.finishedAt = new Date().toISOString();
-        job.summary = msg.content || "(completed with empty response)";
+        job.summary = msg.content.trim();
         job.gitStatus = getGitShortStatus(resolvedCwd);
         saveJobMeta(job);
         log(`Completed in ${step} step(s).`);
@@ -827,7 +835,7 @@ export function generateDigest({ cwd = process.cwd(), hours = 5 } = {}) {
     `# ${hours}-Hour Local Build & GitHub Triage Digest`,
     `Generated: ${new Date().toISOString()}`,
     `Target Repo: ${resolvedCwd}`,
-    `Thermal Status: ${thermal.mode} (${thermal.policy})`,
+    `Thermal Status: ${thermal.mode} | Hardware: ${thermal.macThermal} (${thermal.policy})`,
     "",
     `## 1. Local Git & Test Gate`,
     "```",
@@ -853,4 +861,35 @@ export function generateDigest({ cwd = process.cwd(), hours = 5 } = {}) {
   }
 
   return lines.join("\n");
+}
+
+export function generateBenchmark() {
+  const jobs = listJobs(100);
+  const thermal = getThermalStatus();
+  const completed = jobs.filter((j) => j.status === "completed");
+  const failed = jobs.filter((j) => j.status === "failed");
+  const cancelled = jobs.filter((j) => j.status === "cancelled");
+  const running = jobs.filter((j) => j.status === "running");
+
+  const durationsSec = completed
+    .map((j) => {
+      const s = Date.parse(j.startedAt || "");
+      const e = Date.parse(j.finishedAt || "");
+      return !Number.isNaN(s) && !Number.isNaN(e) && e > s ? (e - s) / 1000 : null;
+    })
+    .filter((v) => v !== null);
+
+  const avgDurationSec = durationsSec.length
+    ? Math.round(durationsSec.reduce((a, b) => a + b, 0) / durationsSec.length)
+    : 0;
+  const totalSteps = jobs.reduce((acc, j) => acc + (Number(j.step) || 0), 0);
+
+  return [
+    "# Inkling Local Workforce — Live Telemetry Summary",
+    `- **Model:** \`${DEFAULT_MODEL}\` via \`${DEFAULT_BASE_URL}\` (0 cloud worker tokens)`,
+    `- **Hardware Thermal State:** \`${thermal.macThermal}\` | Mode: \`${thermal.mode}\` | Policy: \`${thermal.policy}\``,
+    `- **Total Tracked Jobs:** ${jobs.length} (${completed.length} completed, ${running.length} running, ${failed.length} failed, ${cancelled.length} cancelled)`,
+    `- **Total Local Tool/Reasoning Steps Executed:** ${totalSteps}`,
+    `- **Avg Completed Job Wall Time:** ${avgDurationSec}s`,
+  ].join("\n");
 }
