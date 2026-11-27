@@ -1,20 +1,40 @@
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const ROLES_DIR = path.resolve(__dirname, "..", "roles");
+export const REPO_ROOT = path.resolve(__dirname, "..");
+export const ROLES_DIR = path.join(REPO_ROOT, "roles");
+export const LOCAL_OPS_DIR = path.join(REPO_ROOT, "ops", "local");
 
 export const DEFAULT_BASE_URL = process.env.INKLING_BASE_URL || "http://localhost:1235/v1";
 export const DEFAULT_MODEL = process.env.INKLING_MODEL || "inkling-2-mini@q2_k_xl";
 export const DEFAULT_API_KEY = process.env.INKLING_API_KEY || "lm-studio";
 export const DEFAULT_ROLE = process.env.INKLING_ROLE || "implementer";
 
+// Layer 6: Internal Model Aliases (swap providers/quants via config, never code rewrites)
+export const MODEL_ALIASES = {
+  worker: process.env.INKLING_ALIAS_WORKER || DEFAULT_MODEL,
+  fast: process.env.INKLING_ALIAS_FAST || "inkling-2-mini@iq3_xxs",
+  quality: process.env.INKLING_ALIAS_QUALITY || "inkling-2-mini@q3_k_xl",
+  judge: process.env.INKLING_ALIAS_JUDGE || "inkling-2-mini@q3_k_xl",
+  alt: process.env.INKLING_ALIAS_ALT || "ornith-1.5-9b-mlx@4bit",
+};
+
+export function resolveModelAlias(modelOrAlias) {
+  const key = (modelOrAlias || "worker").trim();
+  return MODEL_ALIASES[key] || key;
+}
+
 export const STATE_DIR = process.env.INKLING_STATE_DIR || path.join(os.homedir(), ".inkling-workforce");
 export const JOBS_DIR = process.env.INKLING_JOBS_DIR || path.join(STATE_DIR, "jobs");
+export const DB_FILE = path.join(STATE_DIR, "state.db");
 export const THERMAL_FILE = path.join(STATE_DIR, "thermal.json");
 export const LOCK_FILE = path.join(STATE_DIR, "inference.lock");
 
@@ -25,6 +45,7 @@ export const IDLE_RESET_MINUTES = Number(process.env.INKLING_IDLE_RESET_MINUTES 
 export const STEP_COOLDOWN_MS = Number(process.env.INKLING_STEP_COOLDOWN_MS ?? 8000);
 export const WARM_STEP_COOLDOWN_MS = Number(process.env.INKLING_WARM_STEP_COOLDOWN_MS ?? 18000);
 export const TASK_COOLDOWN_SEC = Number(process.env.INKLING_TASK_COOLDOWN_SEC ?? 60);
+export const HTTP_TIMEOUT_MS = Number(process.env.INKLING_HTTP_TIMEOUT_MS ?? 1200_000); // 20 min (eliminates Node fetch 300s headersTimeout)
 
 const THERMAL_LABELS = ["nominal", "fair", "serious", "critical"];
 const IGNORED_DIRS = new Set([".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", "dist", "build"]);
@@ -44,6 +65,136 @@ function isPidAlive(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+// ─── Layer 2 & Layer 6: SQLite State Store (Checkpoints, Traces, Exceptions) ─
+
+let _db = null;
+export function getStateDb() {
+  if (_db) return _db;
+  ensureDirs();
+  _db = new DatabaseSync(DB_FILE);
+  _db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    CREATE TABLE IF NOT EXISTS job_checkpoints (
+      job_id TEXT PRIMARY KEY,
+      role TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      task TEXT NOT NULL,
+      step INTEGER NOT NULL,
+      messages_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS llm_traces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      job_id TEXT,
+      step INTEGER,
+      requested_model TEXT,
+      resolved_model TEXT NOT NULL,
+      latency_ms INTEGER NOT NULL,
+      prompt_tokens INTEGER DEFAULT 0,
+      completion_tokens INTEGER DEFAULT 0,
+      reasoning_tokens INTEGER DEFAULT 0,
+      finish_reason TEXT,
+      error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS exceptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      job_id TEXT,
+      role TEXT,
+      cwd TEXT,
+      task TEXT,
+      reason TEXT NOT NULL,
+      resolved INTEGER DEFAULT 0
+    );
+  `);
+  return _db;
+}
+
+export function saveCheckpoint({ jobId, role, cwd, task, step, messages }) {
+  try {
+    const db = getStateDb();
+    db.prepare(
+      `INSERT INTO job_checkpoints (job_id, role, cwd, task, step, messages_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(job_id) DO UPDATE SET
+         step = excluded.step,
+         messages_json = excluded.messages_json,
+         updated_at = excluded.updated_at`
+    ).run(jobId, role, cwd, task, step, JSON.stringify(messages), new Date().toISOString());
+  } catch {
+    // non-fatal
+  }
+}
+
+export function loadCheckpoint(jobId) {
+  try {
+    const row = getStateDb().prepare("SELECT * FROM job_checkpoints WHERE job_id = ?").get(jobId);
+    if (!row) return null;
+    return { ...row, messages: JSON.parse(row.messages_json) };
+  } catch {
+    return null;
+  }
+}
+
+export function recordTrace(trace) {
+  try {
+    getStateDb()
+      .prepare(
+        `INSERT INTO llm_traces
+         (created_at, job_id, step, requested_model, resolved_model, latency_ms, prompt_tokens, completion_tokens, reasoning_tokens, finish_reason, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        new Date().toISOString(),
+        trace.jobId || null,
+        trace.step ?? null,
+        trace.requestedModel || null,
+        trace.resolvedModel,
+        trace.latencyMs,
+        trace.promptTokens || 0,
+        trace.completionTokens || 0,
+        trace.reasoningTokens || 0,
+        trace.finishReason || null,
+        trace.error || null
+      );
+  } catch {
+    // non-fatal
+  }
+}
+
+export function recordException({ jobId, role, cwd, task, reason }) {
+  try {
+    getStateDb()
+      .prepare(
+        `INSERT INTO exceptions (created_at, job_id, role, cwd, task, reason, resolved)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`
+      )
+      .run(new Date().toISOString(), jobId || null, role || null, cwd || null, task || null, String(reason));
+  } catch {
+    // non-fatal
+  }
+}
+
+export function listOpenExceptions(limit = 20) {
+  try {
+    return getStateDb()
+      .prepare("SELECT * FROM exceptions WHERE resolved = 0 ORDER BY id DESC LIMIT ?")
+      .all(limit);
+  } catch {
+    return [];
+  }
+}
+
+export function clearExceptions() {
+  try {
+    getStateDb().exec("UPDATE exceptions SET resolved = 1 WHERE resolved = 0");
+  } catch {
+    // ignore
   }
 }
 
@@ -241,7 +392,27 @@ async function withSingleFlightLock(fn, onLog = null) {
   }
 }
 
-// ─── Workspace, Roles & Tool Execution ──────────────────────────────────────
+// ─── Layer 4: Scoped Trusted Context Catalog ────────────────────────────────
+
+export function loadContextCatalog(cwd) {
+  const repoName = path.basename(path.resolve(cwd));
+  const candidates = [
+    path.join(path.resolve(cwd), ".context.json"),
+    path.join(LOCAL_OPS_DIR, repoName, "CONTEXT_CATALOG.json"),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        return JSON.parse(fs.readFileSync(p, "utf8"));
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
+// ─── Workspace, Roles & Tool Execution (Layer 3: Deterministic Boundaries) ──
 
 function resolveInside(cwd, targetPath) {
   const resolvedCwd = path.resolve(cwd);
@@ -252,10 +423,11 @@ function resolveInside(cwd, targetPath) {
   return resolved;
 }
 
-function truncate(str, maxLen = 12000) {
+// Keep tool outputs compact (4500 chars default) so context never balloons into 5+ minute prefills
+function truncate(str, maxLen = 4500) {
   if (!str) return "";
   if (str.length <= maxLen) return str;
-  return str.slice(0, maxLen) + `\n... [truncated ${str.length - maxLen} chars]`;
+  return str.slice(0, maxLen) + `\n... [truncated ${str.length - maxLen} chars; request a specific line range if needed]`;
 }
 
 export function loadRole(roleName = DEFAULT_ROLE) {
@@ -294,6 +466,20 @@ export function listRoles() {
 }
 
 export const AGENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "query_context_catalog",
+      description: "Query the scoped domain context catalog for exact module contracts, routes, schemas, or test commands (faster than reading whole docs).",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "Topic key (or 'index' to list available topics)" },
+        },
+        required: ["topic"],
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -386,7 +572,7 @@ export const AGENT_TOOLS = [
 ];
 
 export const READ_ONLY_TOOLS = AGENT_TOOLS.filter((t) =>
-  ["list_dir", "read_file", "search_files"].includes(t.function.name)
+  ["query_context_catalog", "list_dir", "read_file", "search_files"].includes(t.function.name)
 );
 
 const BLOCKED_REMOTE_PATTERNS = [
@@ -409,12 +595,30 @@ export function checkCommandGovernance(cmd) {
 }
 
 async function executeTool(name, args, { cwd, readOnly }) {
-  if (readOnly && !["list_dir", "read_file", "search_files"].includes(name)) {
+  if (readOnly && !["query_context_catalog", "list_dir", "read_file", "search_files"].includes(name)) {
     return `Error: Tool '${name}' is disabled in read-only mode.`;
   }
 
   try {
     switch (name) {
+      case "query_context_catalog": {
+        const catalog = loadContextCatalog(cwd);
+        if (!catalog) return "No scoped context catalog configured for this repository. Use list_dir / read_file directly.";
+        const topic = String(args.topic || "index").toLowerCase();
+        if (topic === "index" || !catalog.topics?.[topic]) {
+          return JSON.stringify(
+            {
+              summary: catalog.summary,
+              available_topics: Object.keys(catalog.topics || {}),
+              hint: "Call query_context_catalog with any topic name above.",
+            },
+            null,
+            2
+          );
+        }
+        return JSON.stringify(catalog.topics[topic], null, 2);
+      }
+
       case "list_dir": {
         const target = resolveInside(cwd, args.path || ".");
         const entries = fs.readdirSync(target, { withFileTypes: true });
@@ -430,7 +634,7 @@ async function executeTool(name, args, { cwd, readOnly }) {
         const content = fs.readFileSync(target, "utf8");
         const lines = content.split("\n");
         const start = Math.max(1, Number(args.start_line) || 1);
-        const end = Math.min(lines.length, Number(args.end_line) || Math.min(lines.length, start + 299));
+        const end = Math.min(lines.length, Number(args.end_line) || Math.min(lines.length, start + 149));
         const slice = lines.slice(start - 1, end).map((line, i) => `${start + i}: ${line}`).join("\n");
         return truncate(`Showing lines ${start}-${end} of ${lines.length}:\n${slice}`);
       }
@@ -463,7 +667,7 @@ async function executeTool(name, args, { cwd, readOnly }) {
             ["-rnE", "--exclude-dir=.git", "--exclude-dir=node_modules", "--exclude-dir=.venv", "--exclude-dir=__pycache__", String(args.pattern), target],
             { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 }
           );
-          return truncate(out.replaceAll(path.resolve(cwd) + path.sep, ""), 10000) || "(no matches)";
+          return truncate(out.replaceAll(path.resolve(cwd) + path.sep, ""), 4500) || "(no matches)";
         } catch (err) {
           if (err.status === 1) return "(no matches)";
           throw err;
@@ -492,7 +696,7 @@ async function executeTool(name, args, { cwd, readOnly }) {
           child.on("close", (code) => {
             clearTimeout(timer);
             const prefix = killed ? `Command timed out after ${timeout}ms.\n` : `Exit code: ${code}\n`;
-            resolve(truncate(prefix + out, 10000));
+            resolve(truncate(prefix + out, 4500));
           });
           child.on("error", (err) => {
             clearTimeout(timer);
@@ -509,31 +713,77 @@ async function executeTool(name, args, { cwd, readOnly }) {
   }
 }
 
-export async function listModels(baseUrl = DEFAULT_BASE_URL) {
-  const res = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
-    headers: { Authorization: `Bearer ${DEFAULT_API_KEY}` },
+// ─── Layer 6: Resilient LLM Gateway (node:http + 20m timeout + retries + traces) ─
+
+function httpJsonRequest(urlString, { method = "GET", headers = {}, body = null, timeoutMs = HTTP_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlString);
+    const lib = u.protocol === "https:" ? https : http;
+    const payload = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
+
+    const req = lib.request(
+      {
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + u.search,
+        method,
+        headers: {
+          ...headers,
+          ...(payload ? { "Content-Length": payload.length } : {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 500)}`));
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (err) {
+            reject(new Error(`Invalid JSON from LLM gateway: ${err.message}`));
+          }
+        });
+      }
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`LLM gateway socket timeout after ${Math.round(timeoutMs / 1000)}s`));
+    });
+    req.on("error", (err) => reject(err));
+    if (payload) req.write(payload);
+    req.end();
   });
-  if (!res.ok) {
-    throw new Error(`LM Studio returned HTTP ${res.status}: ${await res.text()}`);
-  }
-  const data = await res.json();
+}
+
+export async function listModels(baseUrl = DEFAULT_BASE_URL) {
+  const data = await httpJsonRequest(`${baseUrl.replace(/\/$/, "")}/models`, {
+    headers: { Authorization: `Bearer ${DEFAULT_API_KEY}` },
+    timeoutMs: 15_000,
+  });
   return (data.data || []).map((m) => m.id);
 }
 
 export async function chatCompletion({
   messages,
   tools,
-  model = DEFAULT_MODEL,
+  model = "worker",
   baseUrl = DEFAULT_BASE_URL,
   temperature = 0.2,
   maxTokens = 6144,
+  jobId = null,
+  step = null,
   onLog = null,
 }) {
+  const resolvedModel = resolveModelAlias(model);
   await enforceThermalPolicy(onLog);
 
   return await withSingleFlightLock(async () => {
     const body = {
-      model,
+      model: resolvedModel,
       messages,
       temperature,
       max_tokens: maxTokens,
@@ -543,21 +793,58 @@ export async function chatCompletion({
       body.tool_choice = "auto";
     }
 
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${DEFAULT_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-    });
+    const endpoint = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+    let lastErr = null;
 
-    if (!res.ok) {
-      throw new Error(`LM Studio chat/completions HTTP ${res.status}: ${await res.text()}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const t0 = Date.now();
+      try {
+        const data = await httpJsonRequest(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${DEFAULT_API_KEY}`,
+          },
+          body,
+          timeoutMs: HTTP_TIMEOUT_MS,
+        });
+        const latencyMs = Date.now() - t0;
+        const usage = data.usage || {};
+        recordTrace({
+          jobId,
+          step,
+          requestedModel: model,
+          resolvedModel,
+          latencyMs,
+          promptTokens: usage.prompt_tokens || 0,
+          completionTokens: usage.completion_tokens || 0,
+          reasoningTokens: usage.completion_tokens_details?.reasoning_tokens || 0,
+          finishReason: data.choices?.[0]?.finish_reason || null,
+        });
+        return data;
+      } catch (err) {
+        lastErr = err;
+        const latencyMs = Date.now() - t0;
+        recordTrace({
+          jobId,
+          step,
+          requestedModel: model,
+          resolvedModel,
+          latencyMs,
+          error: err.message,
+        });
+        if (attempt < 3) {
+          const backoffSec = attempt * 10;
+          if (onLog) onLog(`⚠️ LLM gateway transient error (${err.message}); retrying in ${backoffSec}s (attempt ${attempt + 1}/3)...`);
+          await sleep(backoffSec * 1000);
+        }
+      }
     }
-    return await res.json();
+    throw lastErr;
   }, onLog);
 }
+
+// ─── Job Persistence & Checkpointed Agent Loop ──────────────────────────────
 
 export function getJobPaths(jobId) {
   ensureDirs();
@@ -592,6 +879,17 @@ export function getGitShortStatus(cwd) {
   }
 }
 
+export function runDeterministicTests(cwd) {
+  const pytestBin = path.join(path.resolve(cwd), ".venv", "bin", "pytest");
+  if (!fs.existsSync(pytestBin)) return { ran: false, ok: true, output: "(no pytest binary)" };
+  try {
+    const out = execFileSync(pytestBin, ["-q"], { cwd: path.resolve(cwd), encoding: "utf8", timeout: 60_000 }).trim();
+    return { ran: true, ok: true, output: out };
+  } catch (err) {
+    return { ran: true, ok: false, output: `${err.stdout || ""}\n${err.stderr || ""}`.trim() };
+  }
+}
+
 export function newJobId() {
   return `inkling-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
 }
@@ -600,31 +898,39 @@ export async function runAgent({
   task,
   cwd = process.cwd(),
   role = DEFAULT_ROLE,
-  model = DEFAULT_MODEL,
+  model = "worker",
   baseUrl = DEFAULT_BASE_URL,
   maxSteps = null,
   readOnly = null,
   jobId = null,
+  resumeJobId = null,
   onLog = null,
 }) {
-  const roleDef = loadRole(role);
+  const checkpoint = resumeJobId ? loadCheckpoint(resumeJobId) : null;
+  const effectiveRoleName = checkpoint?.role || role;
+  const roleDef = loadRole(effectiveRoleName);
   const effectiveReadOnly = readOnly !== null && readOnly !== undefined ? Boolean(readOnly) : roleDef.readOnly;
   const effectiveMaxSteps = Number(maxSteps) || roleDef.maxSteps || 30;
+  const resolvedModel = resolveModelAlias(model);
 
-  const id = jobId || newJobId();
-  const resolvedCwd = path.resolve(cwd);
+  const id = resumeJobId || jobId || newJobId();
+  const resolvedCwd = path.resolve(checkpoint?.cwd || cwd);
+  const effectiveTask = checkpoint?.task || task;
+  const startStep = checkpoint ? Number(checkpoint.step) + 1 : 1;
+
   const job = {
     id,
     status: "running",
     pid: process.pid,
     role: roleDef.name,
-    model,
+    model: resolvedModel,
     baseUrl,
     cwd: resolvedCwd,
     readOnly: effectiveReadOnly,
-    task,
+    task: effectiveTask,
     maxSteps: effectiveMaxSteps,
-    step: 0,
+    step: checkpoint?.step || 0,
+    resumedFromStep: checkpoint ? checkpoint.step : null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     summary: null,
@@ -639,32 +945,44 @@ export async function runAgent({
   };
 
   log(
-    `Started job ${id} | role=${roleDef.name} | model=${model} | cwd=${resolvedCwd} | thermal=${WORK_WINDOW_MINUTES}m/${BREAK_MINUTES}m`
+    `Started job ${id} | role=${roleDef.name} | model=${resolvedModel} | startStep=${startStep} | cwd=${resolvedCwd}`
   );
 
   const tools = effectiveReadOnly ? READ_ONLY_TOOLS : AGENT_TOOLS;
+  const catalog = loadContextCatalog(resolvedCwd);
+  const catalogBrief = catalog
+    ? [
+        "",
+        "## Scoped Authoritative Domain Context (Layer 4 — Do NOT waste steps reading general docs!)",
+        catalog.summary,
+        `Available catalog topics via \`query_context_catalog\`: ${Object.keys(catalog.topics || {}).join(", ")}`,
+        catalog.quick_contracts ? `\nCore Contracts:\n${catalog.quick_contracts}` : "",
+      ].join("\n")
+    : "";
+
   const systemPrompt = [
     roleDef.instructions,
+    catalogBrief,
     "",
     "## Execution Efficiency Rules",
-    "- Keep internal reasoning concise so you never hit output token limits.",
-    "- Write ONE file per step (`write_file` / `edit_file`) rather than batching multiple large files into a single response.",
+    "- Start editing/writing by Step 2-3! Do NOT read general planning docs (`VISION.md`, `ROADMAP.md`, `ARCHITECTURE.md`) unless explicitly asked — rely on the Scoped Domain Context above and read ONLY the 1-2 source files you are directly touching.",
+    "- Keep internal reasoning concise (<150 words) and write ONE file per step.",
     "",
     "## Mandatory Governance Law (THE BIBLE)",
     "- NEVER run `git push`, `gh pr create`, or any command that updates GitHub. Only local edits, local tests, and local inspection are permitted.",
-    "- Every completed task MUST end with a crisp Local Build Summary (what changed, files touched, exact test/verification output, and any open questions) so the CEO can present it for founder sign-off before anything touches GitHub.",
+    "- Every completed task MUST end with a crisp Local Build Summary (what changed, files touched, exact test/verification output, and any open questions).",
     "",
     `Target workspace directory: ${resolvedCwd}`,
   ].join("\n");
 
-  const messages = [
+  const messages = checkpoint?.messages || [
     { role: "system", content: systemPrompt },
-    { role: "user", content: task },
+    { role: "user", content: effectiveTask },
   ];
 
   try {
-    for (let step = 1; step <= effectiveMaxSteps; step++) {
-      if (step > 1) {
+    for (let step = startStep; step <= effectiveMaxSteps; step++) {
+      if (step > startStep) {
         const hw = getMacHardwareThermal();
         const breatherMs = hw.level >= 1 ? WARM_STEP_COOLDOWN_MS : STEP_COOLDOWN_MS;
         if (breatherMs > 0) {
@@ -676,7 +994,15 @@ export async function runAgent({
       job.step = step;
       saveJobMeta(job);
 
-      const response = await chatCompletion({ messages, tools, model, baseUrl, onLog: log });
+      const response = await chatCompletion({
+        messages,
+        tools,
+        model,
+        baseUrl,
+        jobId: id,
+        step,
+        onLog: log,
+      });
       const choice = response.choices?.[0];
       if (!choice?.message) {
         throw new Error(`Empty response from LM Studio: ${JSON.stringify(response)}`);
@@ -700,18 +1026,35 @@ export async function runAgent({
           messages.push({
             role: "user",
             content:
-              "Your response was cut off by max_tokens before emitting a tool call or final summary. Keep reasoning very short (<150 words) and write ONE file at a time.",
+              "Your response was cut off by max_tokens before emitting a tool call or final summary. Keep reasoning very short (<100 words) and write ONE file at a time.",
           });
+          saveCheckpoint({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, step, messages });
           continue;
         }
         if (!msg.content || !msg.content.trim()) {
           throw new Error(`Model returned an empty completion (finish_reason=${choice.finish_reason || "unknown"}).`);
         }
+
+        // Layer 5: Deterministic test verification before accepting completion on write jobs
+        if (!effectiveReadOnly) {
+          const testRes = runDeterministicTests(resolvedCwd);
+          if (testRes.ran && !testRes.ok && step < effectiveMaxSteps - 1) {
+            log(`Step ${step} deterministic pytest gate failed; feeding errors back to worker...`);
+            messages.push({
+              role: "user",
+              content: `Deterministic test gate (\`.venv/bin/pytest -q\`) failed:\n${truncate(testRes.output, 2500)}\nFix the failing tests before finishing.`,
+            });
+            saveCheckpoint({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, step, messages });
+            continue;
+          }
+        }
+
         job.status = "completed";
         job.finishedAt = new Date().toISOString();
         job.summary = msg.content.trim();
         job.gitStatus = getGitShortStatus(resolvedCwd);
         saveJobMeta(job);
+        saveCheckpoint({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, step, messages });
         log(`Completed in ${step} step(s).`);
         return job;
       }
@@ -737,10 +1080,13 @@ export async function runAgent({
           tool_call_id: tc.id || `call_${step}_${fnName}`,
           content:
             step >= Math.max(1, effectiveMaxSteps - 3)
-              ? `${result}\n\n[STEP BUDGET WARNING: Step ${step}/${effectiveMaxSteps}. Stop exploring immediately and complete all required file writes and your final summary now.]`
+              ? `${result}\n\n[STEP BUDGET WARNING: Step ${step}/${effectiveMaxSteps}. Complete any remaining file writes and your final summary immediately.]`
               : result,
         });
       }
+
+      // Layer 2: Checkpoint after every completed tool step in SQLite
+      saveCheckpoint({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, step, messages });
     }
 
     log(`Reached maxSteps=${effectiveMaxSteps}; requesting final tool-free synthesis...`);
@@ -748,7 +1094,15 @@ export async function runAgent({
       role: "user",
       content: `You have reached the ${effectiveMaxSteps}-step tool limit. Without calling any tools, deliver your complete final report and Local Build Summary now.`,
     });
-    const synthRes = await chatCompletion({ messages, tools: null, model, baseUrl, onLog: log });
+    const synthRes = await chatCompletion({
+      messages,
+      tools: null,
+      model,
+      baseUrl,
+      jobId: id,
+      step: effectiveMaxSteps + 1,
+      onLog: log,
+    });
     const synthText = synthRes.choices?.[0]?.message?.content?.trim();
 
     job.status = "completed";
@@ -764,6 +1118,7 @@ export async function runAgent({
     job.error = err.message;
     job.gitStatus = getGitShortStatus(resolvedCwd);
     saveJobMeta(job);
+    recordException({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, reason: err.message });
     log(`Failed: ${err.message}`);
     return job;
   }
@@ -813,20 +1168,12 @@ export function generateDigest({ cwd = process.cwd(), hours = 5 } = {}) {
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
   } catch {
-    // ignore if no upstream or not git repo
+    // ignore
   }
 
-  let pytestSummary = "(no .venv/bin/pytest found)";
-  const pytestBin = path.join(resolvedCwd, ".venv", "bin", "pytest");
-  if (fs.existsSync(pytestBin)) {
-    try {
-      pytestSummary = execFileSync(pytestBin, ["-q"], { cwd: resolvedCwd, encoding: "utf8" }).trim();
-    } catch (err) {
-      pytestSummary = `FAILED:\n${(err.stdout || "") + (err.stderr || "")}`.trim();
-    }
-  }
-
+  const testRes = runDeterministicTests(resolvedCwd);
   const thermal = getThermalStatus();
+  const exceptions = listOpenExceptions(10);
   const completed = recentJobs.filter((j) => j.status === "completed");
   const running = recentJobs.filter((j) => j.status === "running");
   const failed = recentJobs.filter((j) => j.status === "failed" || j.status === "cancelled");
@@ -837,17 +1184,26 @@ export function generateDigest({ cwd = process.cwd(), hours = 5 } = {}) {
     `Target Repo: ${resolvedCwd}`,
     `Thermal Status: ${thermal.mode} | Hardware: ${thermal.macThermal} (${thermal.policy})`,
     "",
-    `## 1. Local Git & Test Gate`,
+    `## 1. Local Git & Deterministic Test Gate`,
     "```",
     gitBranchStatus || "(clean)",
     gitDiffStat ? `\nDiff Stat:\n${gitDiffStat}` : "",
     unpushedCommits ? `\nLocal Unpushed Commits:\n${unpushedCommits}` : "\nLocal Unpushed Commits: (none)",
     "```",
-    `**Local Test Suite:** \`${pytestSummary.replace(/\n/g, " | ")}\``,
+    `**Pytest Gate:** \`${testRes.output.replace(/\n/g, " | ")}\``,
     "",
-    `## 2. Inkling Jobs in Last ${hours}h (${completed.length} completed, ${running.length} running, ${failed.length} failed/cancelled)`,
+    `## 2. Exception Queue (${exceptions.length} open)`,
   ];
 
+  if (!exceptions.length) {
+    lines.push("- None (queue clear).");
+  } else {
+    for (const ex of exceptions) {
+      lines.push(`- **[#${ex.id}]** \`${ex.role}\` (${ex.job_id}): ${ex.reason}`);
+    }
+  }
+
+  lines.push("", `## 3. Inkling Jobs in Last ${hours}h (${completed.length} completed, ${running.length} running, ${failed.length} failed/cancelled)`);
   if (!recentJobs.length) {
     lines.push("- No Inkling jobs ran in this window.");
   } else {
@@ -871,25 +1227,23 @@ export function generateBenchmark() {
   const cancelled = jobs.filter((j) => j.status === "cancelled");
   const running = jobs.filter((j) => j.status === "running");
 
-  const durationsSec = completed
-    .map((j) => {
-      const s = Date.parse(j.startedAt || "");
-      const e = Date.parse(j.finishedAt || "");
-      return !Number.isNaN(s) && !Number.isNaN(e) && e > s ? (e - s) / 1000 : null;
-    })
-    .filter((v) => v !== null);
-
-  const avgDurationSec = durationsSec.length
-    ? Math.round(durationsSec.reduce((a, b) => a + b, 0) / durationsSec.length)
-    : 0;
-  const totalSteps = jobs.reduce((acc, j) => acc + (Number(j.step) || 0), 0);
+  let traceStats = { calls: 0, avgLatencyMs: 0, totalTokens: 0 };
+  try {
+    const row = getStateDb()
+      .prepare(
+        "SELECT COUNT(*) AS calls, COALESCE(AVG(latency_ms), 0) AS avgLatencyMs, COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS totalTokens FROM llm_traces WHERE error IS NULL"
+      )
+      .get();
+    if (row) traceStats = row;
+  } catch {
+    // ignore
+  }
 
   return [
-    "# Inkling Local Workforce — Live Telemetry Summary",
-    `- **Model:** \`${DEFAULT_MODEL}\` via \`${DEFAULT_BASE_URL}\` (0 cloud worker tokens)`,
+    "# Inkling Local Workforce — 6-Layer Control Plane Telemetry",
+    `- **Model Aliases:** \`worker=${MODEL_ALIASES.worker}\`, \`quality=${MODEL_ALIASES.quality}\`, \`fast=${MODEL_ALIASES.fast}\``,
     `- **Hardware Thermal State:** \`${thermal.macThermal}\` | Mode: \`${thermal.mode}\` | Policy: \`${thermal.policy}\``,
-    `- **Total Tracked Jobs:** ${jobs.length} (${completed.length} completed, ${running.length} running, ${failed.length} failed, ${cancelled.length} cancelled)`,
-    `- **Total Local Tool/Reasoning Steps Executed:** ${totalSteps}`,
-    `- **Avg Completed Job Wall Time:** ${avgDurationSec}s`,
+    `- **Tracked Jobs:** ${jobs.length} (${completed.length} completed, ${running.length} running, ${failed.length} failed, ${cancelled.length} cancelled)`,
+    `- **SQLite Gateway Traces:** ${traceStats.calls} calls | Avg Latency: ${Math.round(traceStats.avgLatencyMs / 1000)}s | Local Tokens Processed: ${traceStats.totalTokens} ($0.00 cloud cost)`,
   ].join("\n");
 }

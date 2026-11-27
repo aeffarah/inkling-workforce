@@ -6,19 +6,25 @@ import {
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
   DEFAULT_ROLE,
+  MODEL_ALIASES,
   STEP_COOLDOWN_MS,
   TASK_COOLDOWN_SEC,
   WORK_WINDOW_MINUTES,
+  clearExceptions,
   enforceThermalPolicy,
   generateBenchmark,
   generateDigest,
+  getGitShortStatus,
   getThermalStatus,
   listJobs,
   listModels,
+  listOpenExceptions,
   listRoles,
   loadJobMeta,
+  recordException,
   resetThermalState,
   runAgent,
+  runDeterministicTests,
   sleep,
   tailJobLog,
   triggerThermalBreak,
@@ -46,38 +52,36 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Inkling Workforce CLI (LM Studio: ${DEFAULT_BASE_URL} | default model: ${DEFAULT_MODEL})
+  console.log(`Inkling Workforce CLI v0.4 (6-Layer Agentic Runtime | LM Studio: ${DEFAULT_BASE_URL})
+Model Aliases: worker=${MODEL_ALIASES.worker} | quality=${MODEL_ALIASES.quality} | fast=${MODEL_ALIASES.fast}
 Thermal Policy: ${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | ${STEP_COOLDOWN_MS}ms step breather | ${TASK_COOLDOWN_SEC}s between loop tasks
 
 Commands:
-  run "<task>"          Run a single autonomous Inkling worker task
+  run "<task>"          Run a single autonomous Inkling worker task (SQLite checkpointed)
     --cwd <dir>         Target project directory (default: current directory)
     --role <name>       Worker role from roles/ (default: ${DEFAULT_ROLE})
-    --model <id>        LM Studio model ID (default: ${DEFAULT_MODEL})
+    --model <alias|id>  Model alias (worker|quality|fast|alt) or ID (default: worker)
     --max-steps <n>     Max tool-calling steps (default: role's max_steps)
     --read-only         Force read-only mode
-    --job-id <id>       Optional explicit job ID
+    --resume <job_id>   Resume an interrupted job from its last SQLite checkpoint!
 
-  loop <backlog.md>     24/7 unattended worker with automatic 45m/15m thermal cooldowns
+  loop <backlog.md>     24/7 sequential worker with SQLite auto-resume & deterministic pytest gate
     --cwd <dir>         Target project directory (default: current directory)
     --role <name>       Default worker role (default: ${DEFAULT_ROLE})
-    --model <id>        LM Studio model ID (default: ${DEFAULT_MODEL})
-    --max-steps <n>     Optional max steps override
-    --interval <sec>    Poll interval when queue is empty (default: 30)
+    --model <alias|id>  Model alias or ID (default: worker)
+    --continue-on-error Do not pause sequential backlog when an item hits the Exception Queue
 
-  thermal [action]      Inspect or control Mac thermal cooldown state:
-                        status (default) | break [minutes] | reset
-  digest                Generate a 4-6h Local Build & GitHub Sign-Off Digest
-    --cwd <dir>         Target project directory (default: current directory)
-    --hours <n>         Lookback window in hours (default: 5)
-
+  exceptions [clear]    View (or clear) the Layer 1 Exception Queue
+  thermal [action]      status (default) | break [minutes] | reset
+  digest                Generate a 5h Local Build, Exception & GitHub Sign-Off Digest
+  benchmark             Show SQLite LLM gateway traces & swarm telemetry
   roles                 List defined worker roles in roles/
   models                List models currently available on LM Studio
   status [job_id]       Show recent jobs or inspect a specific job + tail log
 `);
 }
 
-async function runBacklogLoop(backlogPath, { cwd, defaultRole, model, maxSteps, intervalSec }) {
+async function runBacklogLoop(backlogPath, { cwd, defaultRole, model, maxSteps, intervalSec, continueOnError }) {
   const resolvedBacklog = path.resolve(backlogPath);
   if (!fs.existsSync(resolvedBacklog)) {
     console.error(`Backlog file not found: ${resolvedBacklog}`);
@@ -92,8 +96,14 @@ async function runBacklogLoop(backlogPath, { cwd, defaultRole, model, maxSteps, 
   while (true) {
     const content = fs.readFileSync(resolvedBacklog, "utf8");
     const lines = content.split("\n");
-    const idx = lines.findIndex((l) => /^\s*-\s*\[\s\]\s+/.test(l));
 
+    // Layer 2 & 5: Halt sequential pipeline if an earlier item is marked [!] (unresolved exception) unless --continue-on-error
+    if (!continueOnError && lines.some((l) => /^\s*-\s*\[!\]\s+/.test(l))) {
+      await sleep(intervalSec * 1000);
+      continue;
+    }
+
+    const idx = lines.findIndex((l) => /^\s*-\s*\[\s\]\s+/.test(l));
     if (idx === -1) {
       await sleep(intervalSec * 1000);
       continue;
@@ -116,7 +126,8 @@ async function runBacklogLoop(backlogPath, { cwd, defaultRole, model, maxSteps, 
     lines[idx] = rawLine.replace("- [ ]", "- [~]");
     fs.writeFileSync(resolvedBacklog, lines.join("\n"), "utf8");
 
-    const job = await runAgent({
+    const beforeGit = getGitShortStatus(cwd);
+    let job = await runAgent({
       task: taskText,
       cwd,
       role: taskRole,
@@ -125,17 +136,45 @@ async function runBacklogLoop(backlogPath, { cwd, defaultRole, model, maxSteps, 
       onLog: (m) => console.log(`  ${m}`),
     });
 
+    // Layer 2 Auto-Resume: If interrupted at step >= 2 by a transient error, resume once from SQLite checkpoint!
+    if (job.status !== "completed" && job.step >= 2) {
+      console.log(`[loop] Auto-resuming interrupted job ${job.id} from SQLite checkpoint (step ${job.step})...`);
+      await sleep(10_000);
+      job = await runAgent({
+        resumeJobId: job.id,
+        cwd,
+        role: taskRole,
+        model,
+        maxSteps,
+        onLog: (m) => console.log(`  ${m}`),
+      });
+    }
+
+    // Layer 5 Deterministic Verification Gate
+    const testRes = runDeterministicTests(cwd);
+    const afterGit = getGitShortStatus(cwd);
+    let gateError = null;
+    if (job.status !== "completed") {
+      gateError = job.error || "job failed";
+    } else if (testRes.ran && !testRes.ok) {
+      gateError = "pytest suite failed post-check";
+      recordException({ jobId: job.id, role: taskRole, cwd, task: taskText, reason: gateError });
+    } else if (!job.readOnly && taskRole !== "qa-gatekeeper" && beforeGit === afterGit && !afterGit) {
+      gateError = "no files were created or modified";
+      recordException({ jobId: job.id, role: taskRole, cwd, task: taskText, reason: gateError });
+    }
+
     const latestLines = fs.readFileSync(resolvedBacklog, "utf8").split("\n");
-    const currentIdx = latestLines.findIndex((l) => l.includes(taskText) && l.includes("- [~]"));
+    const currentIdx = latestLines.findIndex((l) => l.includes(taskText.slice(0, 40)) && l.includes("- [~]"));
     const targetIdx = currentIdx !== -1 ? currentIdx : idx;
 
-    if (job.status === "completed") {
+    if (!gateError) {
       latestLines[targetIdx] = latestLines[targetIdx].replace("- [~]", "- [x]") + ` _(role: ${taskRole}, job: ${job.id})_`;
-      console.log(`[loop] Task completed (${job.id}). Cooling ${TASK_COOLDOWN_SEC}s before next item...`);
+      console.log(`[loop] Task verified & completed (${job.id}). Cooling ${TASK_COOLDOWN_SEC}s before next item...`);
     } else {
       latestLines[targetIdx] =
-        latestLines[targetIdx].replace("- [~]", "- [!]") + ` _(failed: ${job.error || "see log"} | job: ${job.id})_`;
-      console.log(`[loop] Task failed (${job.id}): ${job.error}. Cooling ${TASK_COOLDOWN_SEC}s...`);
+        latestLines[targetIdx].replace("- [~]", "- [!]") + ` _(blocked: ${gateError} | job: ${job.id})_`;
+      console.log(`[loop] Task routed to Exception Queue (${job.id}): ${gateError}.`);
     }
     fs.writeFileSync(resolvedBacklog, latestLines.join("\n"), "utf8");
 
@@ -154,11 +193,21 @@ async function main() {
     return;
   }
 
+  if (cmd === "exceptions") {
+    if (positional[1] === "clear") {
+      clearExceptions();
+      console.log("Cleared open exceptions.");
+      return;
+    }
+    const ex = listOpenExceptions(25);
+    console.log(ex.length ? JSON.stringify(ex, null, 2) : "No open exceptions.");
+    return;
+  }
+
   if (cmd === "thermal") {
     const sub = positional[1] || "status";
     if (sub === "break") {
-      const mins = Number(positional[2]) || BREAK_MINUTES;
-      console.log(JSON.stringify(triggerThermalBreak(mins), null, 2));
+      console.log(JSON.stringify(triggerThermalBreak(Number(positional[2]) || BREAK_MINUTES), null, 2));
     } else if (sub === "reset") {
       console.log(JSON.stringify(resetThermalState(), null, 2));
     } else {
@@ -224,19 +273,20 @@ async function main() {
 
   if (cmd === "run") {
     const task = positional.slice(1).join(" ").trim();
-    if (!task) {
-      console.error("Error: missing task description.");
+    if (!task && !flags.resume) {
+      console.error("Error: missing task description (or --resume <job_id>).");
       process.exit(1);
     }
     const job = await runAgent({
       task,
       cwd: flags.cwd || process.cwd(),
       role: flags.role || DEFAULT_ROLE,
-      model: flags.model || DEFAULT_MODEL,
+      model: flags.model || "worker",
       baseUrl: flags["base-url"] || DEFAULT_BASE_URL,
       maxSteps: flags["max-steps"] ? Number(flags["max-steps"]) : null,
       readOnly: flags["read-only"] ? true : null,
       jobId: flags["job-id"] || null,
+      resumeJobId: flags.resume || null,
       onLog: (m) => console.error(m),
     });
     console.log(JSON.stringify(job, null, 2));
@@ -253,9 +303,10 @@ async function main() {
     await runBacklogLoop(backlogPath, {
       cwd: flags.cwd || process.cwd(),
       defaultRole: flags.role || DEFAULT_ROLE,
-      model: flags.model || DEFAULT_MODEL,
+      model: flags.model || "worker",
       maxSteps: flags["max-steps"] ? Number(flags["max-steps"]) : null,
       intervalSec: Number(flags.interval) || 30,
+      continueOnError: Boolean(flags["continue-on-error"]),
     });
     return;
   }
