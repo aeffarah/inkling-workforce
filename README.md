@@ -17,7 +17,8 @@ Built for a **Token-Efficient CEO → Local Workforce** architecture:
   - Enforces a **single-flight GPU lock** (`concurrency = 1`) and **20m work / 10m break** Pomodoro sprints so laptops never thermal-soak during 24/7 runs.
 - **Hard Governance Guardrails (`BIBLE.md`):**
   - Runtime blocks `git push`, `gh pr`, and remote Git mutations inside worker shells — all work stays strictly local until verified and human-approved.
-- **Benchmarked on Real Thinking-Model Workloads:** See [`ops/benchmarks/BASELINE_2026-11-26.md`](ops/benchmarks/BASELINE_2026-11-26.md).
+- **v0.5 Fast-Start Engine (`src/agent.mjs`):** Pre-hydrates backticked target files into Step 1, reads 300-line windows, and runs an automatic `maxSteps - 4` pre-final test gate.
+- **Benchmarked on Real Thinking-Model Workloads:** See [`ops/benchmarks/BASELINE_2026-11-26.md`](ops/benchmarks/BASELINE_2026-11-26.md) and [`ops/benchmarks/OPTIMIZATION_LOG_2026-11-27.md`](ops/benchmarks/OPTIMIZATION_LOG_2026-11-27.md).
 
 ---
 

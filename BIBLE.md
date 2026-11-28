@@ -1,11 +1,15 @@
-# THE BIBLE — Swarm Governance, Thermal Protection & Release Law
+# THE BIBLE — Swarm Governance, Thermal Protection & CEO Release Law (v2.0)
 
 This document is the supreme operating law for the CEO (Antigravity), Chief of Staff, Product Manager, and every Inkling worker agent.
 
-## 1. Zero Unapproved GitHub Updates (Absolute Rule)
-- **NOTHING ever updates to GitHub (`git push`, `gh pr create`, `gh pr merge`, `gh repo`, `gh release`, remote tag/branch mutations) while the swarm is active without notifying the founder and receiving explicit sign-off.**
-- Only **production-ready, locally verified, human-approved** work enters GitHub — across both target application repos and this workforce repo.
-- The Inkling runtime (`src/agent.mjs`) enforces this at the code level by hard-blocking remote Git/GitHub mutation commands.
+## 1. Delegated CEO Release Authority & Worker Containment
+- **Workers Stay Strictly Local-Only:** Inkling worker agents (`src/agent.mjs`) remain **hard-blocked at runtime** from running `git push`, `gh pr`, or any remote Git/GitHub mutation (`BLOCKED_REMOTE_PATTERNS`). Workers build, test, and report locally only.
+- **CEO Production-Ready GitHub Authority:** The Founder delegates GitHub commit, branch push, and PR release authority to the **CEO (Antigravity)** to keep all repositories clean, current, and shipping — subject to mandatory quality gates before every push:
+  1. **100% Green Verification Gate:** All unit tests, integration tests, eval checks, and syntax linters (`pytest`, `unittest`, `node --check`) must pass with zero regressions.
+  2. **CEO Diff Audit:** Every staged diff must be inspected for cleanliness (zero dead code, zero stray `.db`/cache/temp files, zero broken builds).
+  3. **Public-Repo Stealth Gate (Non-Negotiable):** Before any push to a **public** repo, verify **0** matches for secrets (`.env`, API keys), hardcoded local user paths, or private/stealth project references.
+  4. **Zero Destructive Remotes:** Never force-push (`git push --force`), delete remote branches/repos, or rewrite published history without explicit founder confirmation.
+  5. **Full Transparency:** Log every GitHub push in chat and in the 5-hour executive email digest.
 
 ## 2. Thermal Protection & Anti-Burnout Law (Mac Hardware Health)
 To prevent sustained GPU/CPU overheating during 24/7 autonomous runs, the runtime enforces:
@@ -14,13 +18,10 @@ To prevent sustained GPU/CPU overheating during 24/7 autonomous runs, the runtim
 - **20m Work / 10m Break Pomodoro Duty Cycle (20m rest/hr):** After every **20 minutes** of active runtime (`INKLING_WORK_MINUTES=20`), workers automatically pause for a **10-minute cooldown break** (`INKLING_BREAK_MINUTES=10`) so heat soak never builds up.
 - **Generous Breathers:** **8 seconds** (`INKLING_STEP_COOLDOWN_MS=8000`) between every LLM step and **60 seconds** (`INKLING_TASK_COOLDOWN_SEC=60`) between backlog tasks.
 
-## 3. Every 4–6 Hours: CEO Triage & GitHub Sign-Off Gate
-Every ~5 hours while autonomous work is running (`cli.mjs digest` + standing CEO schedule):
-1. **Build & Verify Locally:** Workers implement changes locally and run test suites and evals.
-2. **5-Hour CEO Digest:** The CEO audits completed jobs, runs `qa-gatekeeper` / `cli.mjs digest`, and sends a structured **GitHub Triage Summary**:
-   - **Completed & Verified (Candidates for GitHub PR/Push):** Plain-English summary, files touched (`git diff --stat`), exact test & eval pass/fail counts.
-   - **In-Progress / Hold Local:** Incomplete, failing, or experimental work that stays strictly local.
-3. **Human Sign-Off:** The founder decides item-by-item what gets pushed/PR'd to GitHub and what stays local.
+## 3. Continuous Executive Cadence
+- **Active CEO Supervision:** Review completed worker tasks promptly, unblock stalls/truncations, and keep durable state synced in git-ignored `ops/local/CEO_STATE.md`.
+- **Every 5 Hours (Executive Digest):** Run `cli.mjs digest`, audit diffs and tests, ship verified production-ready work to GitHub, hold experimental/failing work local, and email a concise executive update.
+- **Every Sunday (Weekly Optimization):** Audit all repositories for code redundancy, dead imports, prompt/context efficiency, and swarm telemetry improvements.
 
 ## 4. Public Repo & Stealth Hygiene
 - `inkling-workforce` is a **public** framework repository: never commit hardcoded user home paths, secrets (`.env`), or private/stealth target-project specs (store private sprint backlogs under git-ignored `ops/local/`).

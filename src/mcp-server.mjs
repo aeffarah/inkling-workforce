@@ -9,11 +9,13 @@ import {
   DEFAULT_MODEL,
   DEFAULT_ROLE,
   chatCompletion,
+  generateBenchmark,
   generateDigest,
   getGitShortStatus,
   getThermalStatus,
   listJobs,
   listModels,
+  listOpenExceptions,
   listRoles,
   loadJobMeta,
   loadRole,
@@ -54,7 +56,7 @@ const TOOLS = [
   },
   {
     name: "inkling_start_job",
-    description: "Launch an autonomous Inkling worker agent in the background on any workspace directory. Respects single-flight GPU lock and 45m/15m thermal breaks.",
+    description: "Launch an autonomous Inkling worker agent in the background on any workspace directory. Respects single-flight GPU lock and 20m/10m + hardware thermal breaks.",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,7 +121,7 @@ const TOOLS = [
   },
   {
     name: "inkling_thermal",
-    description: "Inspect or control the 45m/15m Mac thermal duty-cycle state (status, trigger break, or reset).",
+    description: "Inspect or control the 20m/10m + hardware Mac thermal duty-cycle state (status, trigger break, or reset).",
     inputSchema: {
       type: "object",
       properties: {
@@ -138,6 +140,21 @@ const TOOLS = [
         hours: { type: "number", description: "Lookback hours (default: 5)" },
       },
       required: ["cwd"],
+    },
+  },
+  {
+    name: "inkling_benchmark",
+    description: "Show SQLite LLM gateway traces, token totals, average latency, and thermal telemetry.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "inkling_exceptions",
+    description: "List unresolved items in the Layer 1 SQLite Exception Queue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max exceptions to return (default: 20)" },
+      },
     },
   },
 ];
@@ -175,7 +192,7 @@ async function handleToolCall(name, args = {}) {
       messages.push({ role: "user", content: String(args.prompt) });
       const res = await chatCompletion({
         messages,
-        model: args.model || DEFAULT_MODEL,
+        model: args.model || "worker",
         baseUrl: DEFAULT_BASE_URL,
       });
       const content = res.choices?.[0]?.message?.content || "(empty response)";
@@ -197,7 +214,7 @@ async function handleToolCall(name, args = {}) {
         "--role",
         roleDef.name,
         "--model",
-        String(args.model || DEFAULT_MODEL),
+        String(args.model || "worker"),
         "--max-steps",
         String(effectiveMaxSteps),
         "--job-id",
@@ -217,7 +234,7 @@ async function handleToolCall(name, args = {}) {
         status: "running",
         pid: child.pid,
         role: roleDef.name,
-        model: args.model || DEFAULT_MODEL,
+        model: args.model || "worker",
         baseUrl: DEFAULT_BASE_URL,
         cwd: path.resolve(String(args.cwd)),
         readOnly: effectiveReadOnly,
@@ -238,7 +255,7 @@ async function handleToolCall(name, args = {}) {
             pid: child.pid,
             status: "running",
             role: roleDef.name,
-            model: args.model || DEFAULT_MODEL,
+            model: args.model || "worker",
             cwd: path.resolve(String(args.cwd)),
             thermal: getThermalStatus(),
           },
@@ -253,7 +270,7 @@ async function handleToolCall(name, args = {}) {
         task: String(args.task),
         cwd: String(args.cwd),
         role: args.role || DEFAULT_ROLE,
-        model: args.model || DEFAULT_MODEL,
+        model: args.model || "worker",
         baseUrl: DEFAULT_BASE_URL,
         maxSteps: args.max_steps ? Number(args.max_steps) : null,
         readOnly: args.read_only !== undefined ? Boolean(args.read_only) : null,
@@ -323,6 +340,15 @@ async function handleToolCall(name, args = {}) {
       );
     }
 
+    case "inkling_benchmark": {
+      return textResult(generateBenchmark());
+    }
+
+    case "inkling_exceptions": {
+      const ex = listOpenExceptions(Number(args.limit) || 20);
+      return textResult(ex.length ? JSON.stringify(ex, null, 2) : "No open exceptions.");
+    }
+
     default:
       return textResult(`Unknown tool: ${name}`, true);
   }
@@ -352,7 +378,7 @@ rl.on("line", async (line) => {
         result: {
           protocolVersion: params?.protocolVersion || "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "inkling-workforce-mcp", version: "0.2.0" },
+          serverInfo: { name: "inkling-workforce-mcp", version: "0.5.0" },
         },
       });
     } else if (method === "ping") {

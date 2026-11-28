@@ -634,9 +634,9 @@ async function executeTool(name, args, { cwd, readOnly }) {
         const content = fs.readFileSync(target, "utf8");
         const lines = content.split("\n");
         const start = Math.max(1, Number(args.start_line) || 1);
-        const end = Math.min(lines.length, Number(args.end_line) || Math.min(lines.length, start + 149));
+        const end = Math.min(lines.length, Number(args.end_line) || Math.min(lines.length, start + 299));
         const slice = lines.slice(start - 1, end).map((line, i) => `${start + i}: ${line}`).join("\n");
-        return truncate(`Showing lines ${start}-${end} of ${lines.length}:\n${slice}`);
+        return truncate(`Showing lines ${start}-${end} of ${lines.length}:\n${slice}`, 9500);
       }
 
       case "write_file": {
@@ -894,6 +894,41 @@ export function newJobId() {
   return `inkling-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
 }
 
+// v0.5 Fast-Start Pre-Hydration: inline up to 3 target files named in backticks so workers edit on Step 1-2
+export function preloadTaskFiles(cwd, taskText, maxFiles = 3, maxFileChars = 11000) {
+  const matches = [...String(taskText || "").matchAll(/`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`/g)].map((m) => m[1]);
+  const seen = new Set();
+  const blocks = [];
+  for (const rel of matches) {
+    if (seen.has(rel) || rel.startsWith("/") || rel.includes("..")) continue;
+    seen.add(rel);
+    if (blocks.length >= maxFiles) break;
+    try {
+      const full = resolveInside(cwd, rel);
+      if (!fs.existsSync(full)) {
+        blocks.push(`### \`${rel}\` (does not exist yet — create with \`write_file\`)`);
+        continue;
+      }
+      const stat = fs.statSync(full);
+      if (!stat.isFile() || stat.size > maxFileChars) continue;
+      const numbered = fs
+        .readFileSync(full, "utf8")
+        .split("\n")
+        .map((line, i) => `${i + 1}: ${line}`)
+        .join("\n");
+      blocks.push(`### \`${rel}\` (current full contents)\n\`\`\`\n${numbered}\n\`\`\``);
+    } catch {
+      // skip invalid paths
+    }
+  }
+  if (!blocks.length) return "";
+  return [
+    "",
+    "## Pre-Loaded Target Files (v0.5 Fast-Start — DO NOT re-read these with read_file/sed/cat; start editing directly!)",
+    ...blocks,
+  ].join("\n");
+}
+
 export async function runAgent({
   task,
   cwd = process.cwd(),
@@ -964,9 +999,10 @@ export async function runAgent({
     roleDef.instructions,
     catalogBrief,
     "",
-    "## Execution Efficiency Rules",
-    "- Start editing/writing by Step 2-3! Do NOT read general planning docs (`VISION.md`, `ROADMAP.md`, `ARCHITECTURE.md`) unless explicitly asked — rely on the Scoped Domain Context above and read ONLY the 1-2 source files you are directly touching.",
-    "- Keep internal reasoning concise (<150 words) and write ONE file per step.",
+    "## Execution Efficiency Rules (v0.5)",
+    "- Target files named in your task are PRE-LOADED in the user prompt. Start writing/editing on Step 1-2! NEVER waste steps re-reading pre-loaded files via `read_file`, `sed`, `head`, or `cat`.",
+    "- Do NOT read general planning docs (`VISION.md`, `ROADMAP.md`, `ARCHITECTURE.md`) unless explicitly asked — rely on the Scoped Domain Context above.",
+    "- Keep internal reasoning concise (<120 words), batch independent reads if needed, and write ONE file per step.",
     "",
     "## Mandatory Governance Law (THE BIBLE)",
     "- NEVER run `git push`, `gh pr create`, or any command that updates GitHub. Only local edits, local tests, and local inspection are permitted.",
@@ -975,11 +1011,13 @@ export async function runAgent({
     `Target workspace directory: ${resolvedCwd}`,
   ].join("\n");
 
+  const preloadedBlock = checkpoint ? "" : preloadTaskFiles(resolvedCwd, effectiveTask);
   const messages = checkpoint?.messages || [
     { role: "system", content: systemPrompt },
-    { role: "user", content: effectiveTask },
+    { role: "user", content: effectiveTask + preloadedBlock },
   ];
 
+  let nextStepMaxTokens = 6144;
   try {
     for (let step = startStep; step <= effectiveMaxSteps; step++) {
       if (step > startStep) {
@@ -999,10 +1037,12 @@ export async function runAgent({
         tools,
         model,
         baseUrl,
+        maxTokens: nextStepMaxTokens,
         jobId: id,
         step,
         onLog: log,
       });
+      nextStepMaxTokens = 6144;
       const choice = response.choices?.[0];
       if (!choice?.message) {
         throw new Error(`Empty response from LM Studio: ${JSON.stringify(response)}`);
@@ -1022,11 +1062,12 @@ export async function runAgent({
       const toolCalls = msg.tool_calls;
       if (!toolCalls || toolCalls.length === 0) {
         if (choice.finish_reason === "length") {
-          log(`Step ${step} hit max_tokens truncation before tool call; prompting concise retry...`);
+          nextStepMaxTokens = 10240;
+          log(`Step ${step} hit max_tokens truncation; raising retry budget to ${nextStepMaxTokens} and prompting concise edit...`);
           messages.push({
             role: "user",
             content:
-              "Your response was cut off by max_tokens before emitting a tool call or final summary. Keep reasoning very short (<100 words) and write ONE file at a time.",
+              "Your response was cut off by max_tokens before emitting a tool call. Keep reasoning under 60 words and prefer smaller edit_file patches over rewriting an entire large file in one call.",
           });
           saveCheckpoint({ jobId: id, role: roleDef.name, cwd: resolvedCwd, task: effectiveTask, step, messages });
           continue;
@@ -1075,13 +1116,22 @@ export async function runAgent({
         const result = await executeTool(fnName, parsedArgs, { cwd: resolvedCwd, readOnly: effectiveReadOnly });
         log(`Step ${step} tool result (${fnName}): ${truncate(result, 300)}`);
 
+        let budgetSuffix = "";
+        const midPoint = Math.max(4, Math.floor(effectiveMaxSteps * 0.55));
+        if (step === midPoint) {
+          budgetSuffix = `\n\n[PACE CHECK: Step ${step}/${effectiveMaxSteps}. Apply your edits now and run tests soon — do not re-read files already in context.]`;
+        } else if (!effectiveReadOnly && step === Math.max(2, effectiveMaxSteps - 4)) {
+          const preGate = runDeterministicTests(resolvedCwd);
+          budgetSuffix = preGate.ok
+            ? `\n\n[FINAL GATE PRE-CHECK (Step ${step}/${effectiveMaxSteps}): pytest PASSED (${preGate.output.split("\n").pop()}). Wrap up and output your final summary within 2 steps.]`
+            : `\n\n[FINAL GATE PRE-CHECK (Step ${step}/${effectiveMaxSteps}): pytest FAILED! STOP reading files and fix these errors immediately:\n${truncate(preGate.output, 1800)}]`;
+        } else if (step >= Math.max(1, effectiveMaxSteps - 3)) {
+          budgetSuffix = `\n\n[STEP BUDGET WARNING: Step ${step}/${effectiveMaxSteps}. Complete any remaining fix and output your final summary immediately.]`;
+        }
         messages.push({
           role: "tool",
           tool_call_id: tc.id || `call_${step}_${fnName}`,
-          content:
-            step >= Math.max(1, effectiveMaxSteps - 3)
-              ? `${result}\n\n[STEP BUDGET WARNING: Step ${step}/${effectiveMaxSteps}. Complete any remaining file writes and your final summary immediately.]`
-              : result,
+          content: result + budgetSuffix,
         });
       }
 

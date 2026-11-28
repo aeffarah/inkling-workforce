@@ -4,7 +4,6 @@ import path from "node:path";
 import {
   BREAK_MINUTES,
   DEFAULT_BASE_URL,
-  DEFAULT_MODEL,
   DEFAULT_ROLE,
   MODEL_ALIASES,
   STEP_COOLDOWN_MS,
@@ -52,7 +51,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Inkling Workforce CLI v0.4 (6-Layer Agentic Runtime | LM Studio: ${DEFAULT_BASE_URL})
+  console.log(`Inkling Workforce CLI v0.5 (6-Layer Agentic Runtime | LM Studio: ${DEFAULT_BASE_URL})
 Model Aliases: worker=${MODEL_ALIASES.worker} | quality=${MODEL_ALIASES.quality} | fast=${MODEL_ALIASES.fast}
 Thermal Policy: ${WORK_WINDOW_MINUTES}m work / ${BREAK_MINUTES}m break | ${STEP_COOLDOWN_MS}ms step breather | ${TASK_COOLDOWN_SEC}s between loop tasks
 
